@@ -1,0 +1,45 @@
+{
+  "data_dir": "data/clinical_sessions",
+  "preview_fps": 10,
+  "pupil_detector_fps": 60,
+  "pupil_confidence_threshold": 0.6,
+  "status_interval_seconds": 1.0,
+  "startup_timeout_seconds": 12.0,
+  "recording_ack_timeout_seconds": 8.0,
+  "shutdown_timeout_seconds": 5.0,
+  "stale_frame_timeout_seconds": 2.5,
+  "minimum_fps_ratio": 0.65,
+  "max_black_percent": 20.0,
+  "jpeg_quality": 95,
+  "simulate": false,
+  "cameras": [
+    {
+      "name": "right_eye",
+      "index": 1,
+      "width": 320,
+      "height": 240,
+      "fps": 240,
+      "required": true,
+      "fourcc": "MJPG",
+      "record_fourcc": "MJPG",
+      "backend": "dshow",
+      "grayscale": true,
+      "exposure": -8.0,
+      "frame_transform": "rotate_180"
+    },
+    {
+      "name": "left_eye",
+      "index": 0,
+      "width": 320,
+      "height": 240,
+      "fps": 240,
+      "required": true,
+      "fourcc": "MJPG",
+      "record_fourcc": "MJPG",
+      "backend": "dshow",
+      "grayscale": true,
+      "exposure": -8.0,
+      "frame_transform": "none"
+    }
+  ]
+}

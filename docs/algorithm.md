@@ -1,0 +1,40 @@
+# 算法与时间语义
+
+## 实际使用的算法
+
+临床采集使用 PyPI `pupil-detectors==2.0.2` 的 `pupil_detectors.Detector2D`。每路检测器接收一张 8-bit 灰度图，返回一个映射对象，核心字段为：
+
+- `ellipse.center = (x, y)`：像素坐标；
+- `ellipse.axes = (width, height)`：完整轴长，绘制时除以 2 得到 OpenCV 半轴；
+- `ellipse.angle`：椭圆角度；
+- `diameter`：瞳孔直径（像素）；
+- `confidence`：`0–1` 置信度。
+
+`PupilDetectorService` 不在 240 fps 相机循环中调用算法，而是以配置的 `pupil_detector_fps`（默认 60 Hz）读取共享内存里的最新帧。这样做的结果是：检测可以丢帧，原始 AVI 和逐帧时间戳不能丢帧。
+
+## 有效性与输出
+
+当几何字段完整、中心位于图像内且 `confidence >= pupil_confidence_threshold`（默认 `0.6`）时，样本写入 `valid=1`；否则保留该检测行但写入 `valid=0` 和错误/空几何字段。CSV 还记录检测完成时间和延迟，便于剔除异常样本。
+
+预览中的椭圆只是最近一次有效结果；短暂失效时最多保持 100 ms 的最后有效标注，并标记 `PUPIL*`。这不会修改原始 AVI。导出标注视频会重新读取原始帧和 CSV，按 `capture_sequence` 优先、`timestamp_ns` 兜底匹配最近检测；检测结果超过 250 ms 不再绘制为有效结果。
+
+## 时间戳和双眼对齐
+
+相机 worker 在 `read()` 前后各取一次单调时钟，使用中点作为帧时间戳：
+
+```text
+capture_timestamp_ns = (read_started_ns + read_finished_ns) / 2
+```
+
+`*_frames.csv` 的 `capture_sequence` 与 `timestamp_ns` 是录制帧的事实索引；`*_pupil.csv` 引用检测所消费的共享帧序号和时间戳。该方案适合软件近似对齐和离线质量分析，但不等同于硬件触发同步。需要亚毫秒级左右眼同步时，必须增加共享触发、设备时间戳或专用同步硬件，并在现场重新验收。
+
+## 不包含的算法
+
+当前临床版不使用 3D `pye3d`、注视点映射、校准模型、病理分类、情绪识别或诊断规则。页面中的“病理相关/情绪相关”字段只是操作员填写的筛查标签、分数和备注，不是模型输出，也不能替代医生判断。
+
+## 分析建议
+
+1. 先读取 `quality.json`，剔除整体或必需相机 `quality_ok=false` 的会话。
+2. 根据 `*_frames.csv` 和 `*_pupil.csv` 的序号/时间戳做对齐，不要按 CSV 行号猜测 240 fps 连续性。
+3. 将 `valid=0`、低置信度、检测延迟异常或帧流超时样本标记为缺失；不要用前一帧无条件填充。
+4. 将原始 AVI 作为证据源，`*_annotated.avi` 只用于人工复核和质控。

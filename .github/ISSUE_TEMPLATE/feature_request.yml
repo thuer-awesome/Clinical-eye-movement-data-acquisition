@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a focused improvement to the software, hardware interface, or documentation.
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user or engineering problem does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the expected behavior and affected module.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and validation
+      description: Note hardware, safety, privacy, patent, or third-party licensing constraints.

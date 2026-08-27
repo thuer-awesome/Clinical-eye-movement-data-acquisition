@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite the project and the specific version you used."
+title: "Clinical Capture 临床双眼高速采集"
+version: "0.4.0"
+date-released: 2026-08-27
+authors:
+  - name: "Project contributors"
+abstract: "A Windows workstation for de-identified binocular eye-camera acquisition, Pupil Detector2D preview, quality auditing, and reproducible ZIP export."

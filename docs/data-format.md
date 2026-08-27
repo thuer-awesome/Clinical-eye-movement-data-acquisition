@@ -1,0 +1,45 @@
+# 会话数据格式
+
+每次会话目录为 `%LOCALAPPDATA%\\ClinicalCapture\\data\\<session_id>`，其中 `<session_id>` 是 UTC 时间加随机后缀，例如 `20260827T120000Z-a1b2c3d4`。路径只接受安全字符，避免受试者输入穿越目录。
+
+## 文件清单
+
+| 文件 | 级别 | 用途 |
+| --- | --- | --- |
+| `session.json` | 必需 | 脱敏元数据、开始/结束时间、最终状态、相机统计和错误 |
+| `config.json` | 必需 | 本次实际使用的相机索引、方向、分辨率/FPS/FOURCC 和质量参数 |
+| `quality.json` | 必需 | 每路实际 FPS、黑帧比例、写入帧数、编码器和 `quality_ok` |
+| `analysis_ready.csv` | 必需 | 每路一行的汇总，适合导入统计软件前的快速筛选 |
+| `right_eye.avi` / `left_eye.avi` | 有相机时必需 | 按采集时方向保存的原始视频，不含检测叠加 |
+| `*_annotated.avi` | 导出时生成 | 复核视频；不覆盖原始 AVI |
+| `*_frames.csv` | 有相机时必需 | `frame_index`、`capture_sequence`、`timestamp_ns`、UTC 墙上时间 |
+| `*_pupil.csv` | 检测启用时生成 | Detector2D 结果、有效性、椭圆几何、置信度和延迟 |
+| `screening.json` | 可选 | 研究/筛查标签、分数和备注；带非诊断免责声明 |
+| `README.txt` | 必需 | 会话目录内自包含说明 |
+| `export_manifest.json` | 导出时生成 | 文件用途、大小、SHA-256、相机映射和标注文件可用性 |
+
+## `*_pupil.csv` 字段
+
+`camera`、`eye_id`、`sequence`、`capture_timestamp_ns`、`detection_timestamp_ns`、`latency_ms`、`valid`、`confidence`、`center_x`、`center_y`、`radius`、`diameter`、`axis_width`、`axis_height`、`angle`、`detector_fps`、`error`。
+
+`center_x/center_y/axis_*` 单位为像素；`valid` 为 `0/1`；`confidence` 为 `0–1`；时间戳为进程单调时钟纳秒，不能直接当作 Unix epoch。
+
+## `quality.json` 判读
+
+必须同时检查：
+
+- `overall.ready` 是否为真；
+- 每个 `required=true` 相机的 `quality_ok`；
+- `capture_fps` 是否达到 `minimum_fps`；
+- `black_percent`、`recorded_frames`、`recording_codec` 和错误字段；
+- 瞳孔摘要中的 `valid_rate`、`latency_p95_ms` 和 `samples`。
+
+## Manifest 校验
+
+导出 ZIP 中的 `export_manifest.json` 自身不纳入 `files` 哈希，避免“哈希包含自身”的循环。可用 PowerShell 校验原始视频：
+
+```powershell
+Get-FileHash .\\right_eye.avi -Algorithm SHA256
+```
+
+将结果与 manifest 的 `files[].sha256` 比较。原始 AVI 是证据源；标注 AVI 可重新生成，出现生成警告时不得删除或覆盖原始文件。

@@ -1,0 +1,9 @@
+# Runtime dependencies for the Clinical Capture workstation.
+# Keep the ranges broad enough for the existing Python 3.11 environment;
+# the build script freezes the resolved environment into the Windows bundle.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+numpy>=1.26,<3
+opencv-python>=4.8,<5
+pupil-detectors==2.0.2
+pyinstaller>=6.10,<7

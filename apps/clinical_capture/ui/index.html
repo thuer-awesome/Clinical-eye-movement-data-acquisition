@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#14222a" />
+    <title>Clinical Capture 临床采集</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span class="brand-ring"></span><span class="brand-core"></span></div>
+          <div>
+            <div class="brand-name">Clinical Capture</div>
+            <div class="brand-subtitle">临床高速采集工作站</div>
+          </div>
+        </div>
+        <div class="topbar-center">
+          <span class="environment-chip" id="environment-chip">检测中</span>
+          <span class="connection-chip" id="connection-chip"><span class="status-dot"></span><span id="connection-label">连接中</span></span>
+        </div>
+        <div class="topbar-actions">
+          <span class="clock" id="clock">--:--:--</span>
+          <button class="icon-button" id="restart-button" title="重新检查采集设备" aria-label="重新检查采集设备">↻</button>
+          <button class="icon-button exit-button" id="shutdown-button" title="停止本地采集服务" aria-label="停止本地采集服务">×</button>
+        </div>
+      </header>
+
+      <div class="layout">
+        <aside class="sidebar">
+          <div class="workflow-title">本次采集</div>
+          <ol class="workflow" aria-label="采集流程">
+            <li class="workflow-step active" data-step="patient"><span class="step-index">1</span><span><strong>受试者</strong><small>建立脱敏会话</small></span></li>
+            <li class="workflow-step" data-step="check"><span class="step-index">2</span><span><strong>设备检查</strong><small>帧率与画面质量</small></span></li>
+            <li class="workflow-step" data-step="record"><span class="step-index">3</span><span><strong>高速采集</strong><small>进程内持续写盘</small></span></li>
+            <li class="workflow-step" data-step="review"><span class="step-index">4</span><span><strong>复核与导出</strong><small>质量审计与筛查备注</small></span></li>
+          </ol>
+
+          <form id="session-form" class="session-form" autocomplete="off">
+            <div class="form-heading"><span>会话信息</span><span class="required-note">必填 *</span></div>
+            <label>受试者编号 *<input id="subject-code" name="subject_code" maxlength="64" placeholder="例如 P20260826-01" required /></label>
+            <label>访视编号 *<input id="visit-id" name="visit_id" maxlength="64" placeholder="例如 V1" required /></label>
+            <label>采集医生/操作员 *<input id="operator" name="operator" maxlength="120" placeholder="姓名或工号" required /></label>
+            <div class="form-row">
+              <label>年龄<input id="age" name="age" type="number" min="0" max="130" placeholder="可选" /></label>
+              <label>性别<select id="sex" name="sex"><option value="unknown">未记录</option><option value="female">女</option><option value="male">男</option><option value="other">其他</option></select></label>
+            </div>
+            <label>采集方案<select id="protocol" name="protocol"><option>双眼高速采集</option><option>复测采集</option><option>自定义方案</option></select></label>
+            <label>计划筛查<select id="screening" name="screening"><option value="none">暂不标记</option><option value="pathology">病理相关筛查</option><option value="emotion">情绪相关筛查</option><option value="custom">其他研究量表</option></select></label>
+            <label>备注<textarea id="notes" name="notes" rows="3" maxlength="4000" placeholder="只记录采集相关信息，不填写姓名、身份证号等直接身份信息"></textarea></label>
+            <label class="consent-line"><input id="consent" type="checkbox" /> <span>已完成知情同意及院内数据授权确认</span></label>
+            <button class="primary-button" id="start-button" type="submit" disabled><span class="button-dot"></span>开始采集</button>
+            <button class="danger-button hidden" id="stop-button" type="button"><span class="button-square"></span>结束并保存</button>
+          </form>
+
+          <div class="sidebar-note">数据默认保存在本机临床会话目录。导出包包含原始视频、时间戳、质量报告和筛查备注，不自动生成诊断结论。</div>
+        </aside>
+
+        <main class="main-content">
+          <section class="page-heading">
+            <div>
+              <p class="eyebrow">ACQUISITION CONSOLE</p>
+              <h1 id="page-title">设备检查</h1>
+              <p class="page-description" id="page-description">确认双眼相机持续出帧后，再开始临床会话。</p>
+            </div>
+            <div class="session-badge hidden" id="session-badge"><span class="recording-pulse"></span><span id="session-badge-label">未开始</span></div>
+          </section>
+
+          <section class="notice-strip" id="notice-strip" role="status">
+            <span class="notice-icon">i</span><span id="notice-text">正在连接本地采集服务…</span>
+          </section>
+
+          <section class="metrics-row" aria-label="采集摘要">
+            <div class="metric-card"><span class="metric-label">必需设备</span><strong id="metric-ready">—</strong><span class="metric-foot" id="metric-ready-foot">等待检查</span></div>
+            <div class="metric-card"><span class="metric-label">双眼帧率</span><strong id="metric-fps">—</strong><span class="metric-foot" id="metric-fps-foot">现场目标 240 fps</span></div>
+            <div class="metric-card"><span class="metric-label">当前状态</span><strong id="metric-state">连接中</strong><span class="metric-foot" id="metric-state-foot">—</span></div>
+            <div class="metric-card"><span class="metric-label">本机存储</span><strong id="metric-storage">本地</strong><span class="metric-foot">导出前请复核</span></div>
+          </section>
+
+          <section class="camera-section">
+            <div class="section-heading"><div><h2>实时画面与质量</h2><span>预览低频刷新，录制由采集进程独立写盘</span></div><div class="section-actions"><button class="secondary-button" id="device-settings-button" type="button">设备设置</button><button class="secondary-button" id="preflight-button" type="button">重新检查</button></div></div>
+            <div class="device-settings-panel hidden" id="device-settings-panel">
+              <form id="device-settings-form">
+                <div class="device-settings-heading"><div><h3>双眼相机设置</h3><span id="device-settings-state">尚未确认</span></div><button class="secondary-button" id="scan-cameras-button" type="button">扫描相机</button></div>
+                <div class="camera-candidates hidden" id="camera-candidates"></div>
+                <div class="device-settings-grid">
+                  <fieldset>
+                    <legend>右眼</legend>
+                    <label>相机编号<select id="right-camera-index"></select></label>
+                    <label>画面方向<select id="right-camera-transform"><option value="none">正常</option><option value="rotate_180">旋转 180°</option><option value="flip_horizontal">水平镜像</option><option value="flip_vertical">上下翻转</option></select></label>
+                  </fieldset>
+                  <fieldset>
+                    <legend>左眼</legend>
+                    <label>相机编号<select id="left-camera-index"></select></label>
+                    <label>画面方向<select id="left-camera-transform"><option value="none">正常</option><option value="rotate_180">旋转 180°</option><option value="flip_horizontal">水平镜像</option><option value="flip_vertical">上下翻转</option></select></label>
+                  </fieldset>
+                </div>
+                <div class="device-settings-actions"><button class="secondary-button" id="swap-cameras-button" type="button">交换左右相机</button><span class="action-spacer"></span><button class="secondary-button" id="cancel-device-settings" type="button">取消</button><button class="primary-button compact" type="submit">保存并重启相机</button></div>
+              </form>
+            </div>
+            <div class="camera-grid" id="camera-grid"></div>
+          </section>
+
+          <section class="review-section" id="review-section">
+            <div class="section-heading"><div><h2>已完成会话</h2><span>按时间倒序显示最近记录</span></div><button class="secondary-button" id="refresh-sessions" type="button">刷新列表</button></div>
+            <div class="session-table-wrap"><table class="session-table"><thead><tr><th>会话</th><th>受试者编号</th><th>时间</th><th>结果</th><th></th></tr></thead><tbody id="session-list"><tr><td colspan="5" class="empty-state">暂无已完成会话</td></tr></tbody></table></div>
+            <div class="screening-panel hidden" id="screening-panel">
+              <div><h3>附加筛查备注</h3><p>只保存研究/筛查记录，不替代临床诊断。</p></div>
+              <form id="screening-form" class="screening-form"><select id="screening-type"><option value="none">不标记</option><option value="pathology">病理相关筛查</option><option value="emotion">情绪相关筛查</option><option value="custom">其他研究量表</option></select><input id="screening-label" maxlength="200" placeholder="标签（可选）" /><input id="screening-score" type="number" min="0" max="100" step="0.1" placeholder="分数 0–100（可选）" /><button class="secondary-button" type="submit">保存备注</button></form>
+            </div>
+            <div class="export-result hidden" id="export-result">
+              <div class="export-heading"><strong>导出文件位置</strong><span id="export-size">—</span></div>
+              <div class="export-path" id="export-path">—</div>
+              <div class="export-actions"><button class="secondary-button" id="copy-export-path" type="button">复制路径</button><a class="secondary-button" id="download-export" href="#" download>下载 ZIP</a></div>
+              <div class="export-inventory" aria-label="ZIP 文件说明">
+                <h3>ZIP 文件说明</h3>
+                <dl>
+                  <div><dt><code>*_annotated.avi</code></dt><dd>带瞳孔轮廓、中心、置信度、延迟和帧号的复核视频</dd></div>
+                  <div><dt><code>*.avi</code></dt><dd>按所选方向保存的原始视频，不烧录识别图层</dd></div>
+                  <div><dt><code>*_frames.csv</code></dt><dd>每个写入帧的序号与采集时间戳</dd></div>
+                  <div><dt><code>*_pupil.csv</code></dt><dd>瞳孔有效性、几何参数、置信度与识别延迟</dd></div>
+                  <div><dt><code>quality.json</code></dt><dd>双眼帧率、黑帧比例和录制质量检查</dd></div>
+                  <div><dt><code>config.json / session.json</code></dt><dd>物理相机映射、画面方向、采集模式与会话信息</dd></div>
+                  <div><dt><code>analysis_ready.csv</code></dt><dd>便于统计软件读取的双眼汇总表</dd></div>
+                  <div><dt><code>export_manifest.json</code></dt><dd>完整文件清单、用途、字节数和 SHA-256 校验值（清单自身不纳入哈希）</dd></div>
+                </dl>
+                <p>高速模式保留相机实际采集分辨率；软件放大不会增加真实细节。</p>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <div class="toast" id="toast" role="alert" aria-live="assertive"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

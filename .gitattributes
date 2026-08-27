@@ -1,0 +1,18 @@
+* text=auto
+
+# Preserve CAD exchange files and printable meshes exactly.
+*.stl binary
+*.STL binary
+*.step -text
+*.STEP -text
+*.stp -text
+
+# Preserve office documents, PDFs, and image assets as binary files.
+*.doc binary
+*.docx binary
+*.pdf binary
+*.ppt binary
+*.pptx binary
+*.png binary
+*.jpg binary
+*.jpeg binary

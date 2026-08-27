@@ -1,0 +1,57 @@
+.conda/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+upstream/pupil/
+upstream/pupil-geometry/
+.superpowers/
+sessions/
+apps/binocular_calibration/runtime-tests/
+apps/binocular_calibration/sessions/
+apps/gaze_os_ui/node_modules/
+apps/gaze_os_ui/dist/
+apps/gaze_os_ui/*.tsbuildinfo
+apps/gaze_os_ui/vite.config.d.ts
+reports/
+
+# Local logs and runtime traces.
+*.log
+*.err.log
+*.out.log
+data/logs/
+.codex-temp/
+
+# Local binaries and compiled artifacts.
+*.pyo
+*.pyd
+*.dll
+*.exe
+*.bin
+*.whl
+
+# Archives and local exports. Source CAD and individual STL files remain
+# trackable; the mechanical bundle is reproducible from CAD plus STL.
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# Clinical Capture build output and local session data.
+build/
+dist/
+data/clinical_sessions/
+.codex-temp/clinical_*/
+ClinicalCapture-portable-fixed/
+ClinicalCapture.exe_extracted/
+
+# Pretrained model payloads stay local. Keep source manifests and download
+# scripts in version control so the exact payload can be reproduced.
+models/**/.cache/
+models/**/*.bin
+models/**/*.safetensors
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+!models/**/model-manifest.json
