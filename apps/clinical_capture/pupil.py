@@ -546,6 +546,8 @@ class PupilDetectorService:
             guidance = f"瞳孔置信度已达标，请保持不动 {remaining:.1f} 秒"
         elif not fresh and latest_state == "ready":
             guidance = "检测帧已过期，请保持相机稳定并重新对准"
+        elif latest_state == "error" and latest.get("error"):
+            guidance = str(latest.get("error"))
         return {
             "state": state,
             "ready": ready,
