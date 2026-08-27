@@ -120,7 +120,16 @@
     refs.badge.classList.toggle("hidden", !recording);
     refs.badgeLabel.textContent = appState === "stopping" ? "正在保存" : "正在采集";
     refs.pageTitle.textContent = recording ? "高速采集" : (needsDeviceConfirmation ? "设备设置" : (status.last_session ? "复核与导出" : "设备检查"));
-    refs.pageDescription.textContent = recording ? "采集进程直接写盘，浏览器预览不会影响原始帧。" : (needsDeviceConfirmation ? "确认左右眼相机和画面方向后，再开始临床会话。" : (status.last_session ? "确认质量指标并附加筛查备注，再导出会话包。" : "确认双眼相机持续出帧后，再开始临床会话。"));
+    const alignment = status.preflight?.pupil_alignment;
+    refs.pageDescription.textContent = recording
+      ? "采集进程直接写盘，浏览器预览不会影响原始帧。"
+      : needsDeviceConfirmation
+        ? "确认左右眼相机和画面方向后，再开始临床会话。"
+        : status.last_session
+          ? "确认质量指标并附加筛查备注，再导出会话包。"
+          : alignment?.required && !alignment?.ready
+            ? "请根据双眼实时提示微调相机，瞳孔置信度稳定达标后才可开始采集。"
+            : "确认双眼相机持续出帧后，再开始临床会话。";
   }
 
   function renderMetrics() {
@@ -157,7 +166,7 @@
         return `<article class="camera-card ${camera.required ? "" : "optional"}" data-camera="${escapeHtml(camera.name)}">
           <div class="camera-header"><div><span class="camera-name" data-field="name">${escapeHtml(cameraNameLabel(camera.name))}</span><span class="camera-role" data-field="mapping">${camera.required ? "必需" : "可选"} · ${escapeHtml(cameraMappingLabel(camera))}</span><span class="camera-mode" data-field="mode">实际模式检测中</span></div><span class="camera-state" data-field="state">等待</span></div>
           <div class="camera-preview"><img data-preview="${escapeHtml(camera.name)}" src="${previewUrl}?t=${Date.now()}" alt="${escapeHtml(cameraNameLabel(camera.name))} 实时预览" /><div class="preview-empty">等待画面</div></div>
-          <div class="camera-footer"><div class="camera-stat"><label>采集帧率</label><strong data-field="fps">—</strong></div><div class="camera-stat"><label>黑帧</label><strong data-field="black">—</strong></div><div class="camera-stat"><label>已写入</label><strong data-field="frames">—</strong></div><div class="camera-stat pupil-stat"><label>瞳孔捕捉</label><strong data-field="pupil">检测中</strong></div><div class="quality-bar" title="相对目标帧率"><span data-field="quality"></span></div></div>
+          <div class="camera-footer"><div class="camera-stat"><label>采集帧率</label><strong data-field="fps">—</strong></div><div class="camera-stat"><label>黑帧</label><strong data-field="black">—</strong></div><div class="camera-stat"><label>已写入</label><strong data-field="frames">—</strong></div><div class="camera-stat pupil-stat"><label>瞳孔捕捉</label><strong data-field="pupil">检测中</strong></div><div class="pupil-alignment" data-field="alignment">等待瞳孔对准提示</div><div class="quality-bar" title="相对目标帧率"><span data-field="quality"></span></div></div>
         </article>`;
       }).join("");
       state.cameraKey = key;
@@ -208,6 +217,18 @@
         else pupilNode.textContent = "检测中";
         pupilNode.title = pupil.latency_ms == null ? "" : `检测延迟 ${Number(pupil.latency_ms).toFixed(1)} ms`;
       }
+      const alignment = pupil.alignment || {};
+      const alignmentNode = card.querySelector('[data-field="alignment"]');
+      if (alignmentNode) {
+        const alignmentState = String(alignment.state || "searching");
+        alignmentNode.className = `pupil-alignment ${alignmentState}`;
+        const progress = Math.max(0, Math.min(1, Number(alignment.progress || 0)));
+        alignmentNode.style.setProperty("--alignment-progress", `${(progress * 100).toFixed(0)}%`);
+        alignmentNode.textContent = state.status?.simulate && state.status?.preflight?.pupil_alignment?.required === false
+          ? "模拟模式 · 跳过对准门禁"
+          : (alignment.guidance || "等待瞳孔对准提示");
+        alignmentNode.title = alignment.threshold == null ? "" : `目标置信度 ≥ ${(Number(alignment.threshold) * 100).toFixed(0)}%`;
+      }
       const qualityNode = card.querySelector('[data-field="quality"]');
       if (qualityNode) qualityNode.style.width = `${quality}%`;
       const empty = card.querySelector(".preview-empty");
@@ -238,7 +259,9 @@
   function renderFormState() {
     const status = state.status;
     const recording = status?.app_state === "recording" || status?.app_state === "stopping";
-    const canStart = !state.busy && !recording && status?.app_state === "ready" && !!status?.preflight?.ready && $("consent").checked && $("subject-code").value.trim() && $("visit-id").value.trim() && $("operator").value.trim();
+    const alignment = status?.preflight?.pupil_alignment;
+    const alignmentReady = !alignment?.required || !!alignment?.ready;
+    const canStart = !state.busy && !recording && status?.app_state === "ready" && !!status?.preflight?.ready && alignmentReady && $("consent").checked && $("subject-code").value.trim() && $("visit-id").value.trim() && $("operator").value.trim();
     refs.start.disabled = !canStart;
     refs.start.classList.toggle("hidden", recording);
     refs.stop.classList.toggle("hidden", !recording);
@@ -411,7 +434,9 @@
       const [statusPayload, sessionsPayload] = await Promise.all([request("/api/status"), request("/api/sessions")]);
       state.status = statusPayload; state.sessions = sessionsPayload.items || [];
       refs.connection.classList.add("online"); refs.connection.classList.remove("offline"); refs.connectionLabel.textContent = "本地服务在线";
-      setNotice(statusPayload.last_error || (statusPayload.preflight?.ready ? "设备预检通过，可以开始采集。" : (statusPayload.preflight?.blocking_reasons?.[0] || "等待设备检查。")), statusPayload.preflight?.ready ? "success" : (statusPayload.last_error ? "error" : ""));
+      const alignment = statusPayload.preflight?.pupil_alignment;
+      const guidance = alignment?.required && !alignment?.ready ? alignment.guidance : null;
+      setNotice(statusPayload.last_error || (statusPayload.preflight?.ready ? "设备预检通过，可以开始采集。" : (guidance || statusPayload.preflight?.blocking_reasons?.[0] || "等待设备检查。")), statusPayload.preflight?.ready ? "success" : (statusPayload.last_error ? "error" : ""));
       renderAll();
       evaluateCameraRecovery();
     } catch (error) {

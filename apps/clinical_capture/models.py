@@ -126,6 +126,12 @@ class ClinicalConfig:
     preview_fps: int = 6
     pupil_detector_fps: int = 60
     pupil_confidence_threshold: float = 0.6
+    # Recording is blocked until every required eye has a stable, centered
+    # pupil detection.  The hold avoids starting while the operator is still
+    # moving the camera or the patient is blinking.
+    pupil_alignment_hold_seconds: float = 1.5
+    pupil_alignment_center_tolerance: float = 0.30
+    pupil_alignment_max_age_seconds: float = 0.75
     status_interval_seconds: float = 1.0
     startup_timeout_seconds: float = 12.0
     recording_ack_timeout_seconds: float = 8.0
@@ -169,7 +175,9 @@ class ClinicalConfig:
             raise ValueError("clinical configuration must be a JSON object")
         allowed = {
             "cameras", "data_dir", "preview_fps", "pupil_detector_fps",
-            "pupil_confidence_threshold", "status_interval_seconds",
+            "pupil_confidence_threshold", "pupil_alignment_hold_seconds",
+            "pupil_alignment_center_tolerance", "pupil_alignment_max_age_seconds",
+            "status_interval_seconds",
             "startup_timeout_seconds", "recording_ack_timeout_seconds",
             "shutdown_timeout_seconds", "stale_frame_timeout_seconds",
             "minimum_fps_ratio", "max_black_percent", "jpeg_quality", "simulate",
@@ -223,6 +231,22 @@ class ClinicalConfig:
             or not 0 <= float(self.pupil_confidence_threshold) <= 1
         ):
             raise ValueError("pupil_confidence_threshold must be between 0 and 1")
+        for name in ("pupil_alignment_hold_seconds", "pupil_alignment_max_age_seconds"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"{name} must be a positive finite number")
+        if (
+            isinstance(self.pupil_alignment_center_tolerance, bool)
+            or not isinstance(self.pupil_alignment_center_tolerance, (int, float))
+            or not math.isfinite(float(self.pupil_alignment_center_tolerance))
+            or not 0.05 <= float(self.pupil_alignment_center_tolerance) <= 0.49
+        ):
+            raise ValueError("pupil_alignment_center_tolerance must be between 0.05 and 0.49")
         for name in (
             "status_interval_seconds", "startup_timeout_seconds", "recording_ack_timeout_seconds",
             "shutdown_timeout_seconds", "stale_frame_timeout_seconds",
@@ -250,6 +274,9 @@ class ClinicalConfig:
             "preview_fps": self.preview_fps,
             "pupil_detector_fps": self.pupil_detector_fps,
             "pupil_confidence_threshold": self.pupil_confidence_threshold,
+            "pupil_alignment_hold_seconds": self.pupil_alignment_hold_seconds,
+            "pupil_alignment_center_tolerance": self.pupil_alignment_center_tolerance,
+            "pupil_alignment_max_age_seconds": self.pupil_alignment_max_age_seconds,
             "status_interval_seconds": self.status_interval_seconds,
             "startup_timeout_seconds": self.startup_timeout_seconds,
             "recording_ack_timeout_seconds": self.recording_ack_timeout_seconds,

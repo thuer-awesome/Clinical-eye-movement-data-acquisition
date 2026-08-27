@@ -13,14 +13,15 @@ Clinical Capture 是面向临床研究和筛查记录的 Windows 双眼眼部相
 - 复用 `pupil-detectors` 的 `Detector2D`，以独立、限速的最新帧检测线程输出中心、椭圆、直径、置信度和延迟。
 - 首次使用扫描相机，明确保存物理索引和画面方向；更换 USB 口或相机后可重新映射。
 - 预检显示驱动实际宽高、FPS、FOURCC、黑帧比例、帧流超时和写盘状态；低帧率重启是有限的，不会无限重试。
-- 结束时生成 `quality.json`、`analysis_ready.csv`，导出时保留原始证据并生成标注复核视频和 SHA-256 清单。
+- 录制前要求双眼瞳孔达到置信度阈值并连续稳定保持；未对准时按页面提示向左/右/上/下微调相机，后端也会阻止绕过 UI 开始录制。
+- 结束时生成 `quality.json`、`analysis_ready.csv`、`*_pupil.csv`，导出时保留原始证据并生成带瞳孔轮廓的复核视频、代表性静帧、`pupil_report.json` 和 SHA-256 清单。
 - 受试者编号、访视编号和操作员字段强制脱敏格式；必须确认知情同意后才可开始。
 
 ## 先给医生
 
 从 GitHub Actions 的 Windows 构建产物或 Release 下载 `ClinicalCapture-portable.zip`，完整解压后双击目录内的 `ClinicalCapture.exe`（也可双击 `ClinicalCapture-Start.cmd`）。不需要安装 Python、Node 或打开 VSCode。
 
-第一次在一台电脑上使用：点击“扫描相机”→根据缩略图分别设为右眼/左眼→确认方向→“保存并重启相机”。之后填写脱敏会话信息、勾选知情同意、开始采集；结束后先看质量指标，再在“已完成会话”中导出 ZIP。详细步骤见 [临床操作 SOP](docs/clinical-sop.md) 和 [Windows 安装](docs/installation.md)。
+第一次在一台电脑上使用：点击“扫描相机”→根据缩略图分别设为右眼/左眼→确认方向→“保存并重启相机”。正式采集前还要根据每只眼实时提示把瞳孔移入中心，等待“对准完成”后开始按钮才会启用。结束后先看质量指标和 `pupil_report.json`，再在“已完成会话”中导出 ZIP。详细步骤见 [临床操作 SOP](docs/clinical-sop.md) 和 [Windows 安装](docs/installation.md)。
 
 默认数据目录为 `%LOCALAPPDATA%\\ClinicalCapture\\data`。不要只复制一个 `.exe`；PyInstaller onedir 运行需要同目录的 `_internal` 文件。
 
@@ -67,7 +68,7 @@ py -3.11 -m venv .venv
 | [架构](docs/architecture.md) | 接手开发者 | 进程、线程、共享帧、状态机和故障收口 |
 | [算法说明](docs/algorithm.md) | 算法/分析人员 | Detector2D 输入输出、阈值、时间戳和已知限制 |
 | [相机与质量](docs/camera-tuning.md) | 设备工程师 | UVC/DirectShow、分辨率、帧率、清晰度、曝光和带宽 |
-| [数据格式](docs/data-format.md) | 分析人员 | ZIP 内每个文件、CSV 字段和 manifest 校验 |
+| [数据格式](docs/data-format.md) | 分析人员 | ZIP 内原始/标注图像、瞳孔 CSV、报告和 manifest 校验 |
 | [API](docs/api.md) | 前后端开发者 | 本地 REST 路由、状态字段和错误语义 |
 | [Windows 安装](docs/installation.md) | IT/现场支持 | 便携版、源码运行和打包发布 |
 | [临床操作 SOP](docs/clinical-sop.md) | 医生/操作员 | 采集前、采集中、结束和异常处理 |
@@ -89,4 +90,4 @@ tests/                    无相机模拟测试、编码清晰度和导出完整
 
 ## 版本与许可证
 
-当前版本为 `0.4.0`。本项目自有代码和资料暂未授予默认开源许可证；公开分发前请获得项目负责人的明确授权。`pupil-detectors` 由 Pupil Labs 以 MIT 许可证发布，运行依赖和来源见 [NOTICE.md](NOTICE.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要上传真实受试者数据、凭据或运行日志。
+当前版本为 `0.5.0`。本项目自有代码和资料暂未授予默认开源许可证；公开分发前请获得项目负责人的明确授权。`pupil-detectors` 由 Pupil Labs 以 MIT 许可证发布，运行依赖和来源见 [NOTICE.md](NOTICE.md)。安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要上传真实受试者数据、凭据或运行日志。

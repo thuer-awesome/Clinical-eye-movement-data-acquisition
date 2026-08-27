@@ -12,8 +12,8 @@
 
 - 新增配置字段：改 `models.py` 的 `from_mapping/validate/public_dict`、示例 JSON、README/数据文档和测试。
 - 改相机采集：改 `worker.py`，保留 `capture_timestamp_ns`、`frames.csv`、状态队列和 `recording_codec` 契约；不要把算法塞回高帧率循环。
-- 改检测字段：同步 `pupil.py` 的 CSV header、UI 状态、`storage.py` 的汇总和 `docs/data-format.md`。
-- 改导出：只在 `exporter.py` 派生文件；原始 AVI 不覆盖；manifest 排除自身哈希并增加回归测试。
+- 改检测字段：同步 `pupil.py` 的 CSV header、对准门禁状态、UI 状态、`storage.py` 的汇总和 `docs/data-format.md`。
+- 改导出：只在 `exporter.py` 派生文件；原始 AVI 不覆盖；同时维护 `_annotated.avi`、`*_pupil_preview.jpg`、`pupil_report.json`；manifest 排除自身哈希并增加回归测试。
 - 改路由：更新 `docs/api.md`、请求超时和错误映射，确保录制中的设备设置仍返回 `409`。
 - 改打包：同步 `packaging/clinical_capture.spec`、版本号、便携说明和 CI Windows job。
 
@@ -31,6 +31,7 @@
 ## 已知缺口
 
 - 当前软件测试主要使用模拟相机；真实硬件需现场验证。
+- 真实模式的录制前对准门禁依赖 `Detector2D` 的实时置信度和中心位置；阈值、中心容差和连续保持时间需按镜头/照明现场验收后再调整。
 - 时间戳为主机单调时钟中点，不是硬件触发同步。
 - `pupil-detectors` 是 2D 瞳孔几何检测，不提供 3D 深度、注视映射或诊断。
 - OpenCV/DirectShow 对相机控制项的支持依驱动而异；曝光和增益回读失败时需使用厂家 SDK。

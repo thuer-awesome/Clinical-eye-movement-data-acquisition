@@ -12,8 +12,10 @@
 | `analysis_ready.csv` | 必需 | 每路一行的汇总，适合导入统计软件前的快速筛选 |
 | `right_eye.avi` / `left_eye.avi` | 有相机时必需 | 按采集时方向保存的原始视频，不含检测叠加 |
 | `*_annotated.avi` | 导出时生成 | 复核视频；不覆盖原始 AVI |
+| `*_pupil_preview.jpg` | 导出时生成 | 每只眼一张带瞳孔轮廓、中心和置信度的代表性复核静帧 |
 | `*_frames.csv` | 有相机时必需 | `frame_index`、`capture_sequence`、`timestamp_ns`、UTC 墙上时间 |
 | `*_pupil.csv` | 检测启用时生成 | Detector2D 结果、有效性、椭圆几何、置信度和延迟 |
+| `pupil_report.json` | 导出时生成 | 每只眼检测样本/有效率/置信度统计、对准门禁参数和复核文件索引；不是诊断报告 |
 | `screening.json` | 可选 | 研究/筛查标签、分数和备注；带非诊断免责声明 |
 | `README.txt` | 必需 | 会话目录内自包含说明 |
 | `export_manifest.json` | 导出时生成 | 文件用途、大小、SHA-256、相机映射和标注文件可用性 |
@@ -23,6 +25,8 @@
 `camera`、`eye_id`、`sequence`、`capture_timestamp_ns`、`detection_timestamp_ns`、`latency_ms`、`valid`、`confidence`、`center_x`、`center_y`、`radius`、`diameter`、`axis_width`、`axis_height`、`angle`、`detector_fps`、`error`。
 
 `center_x/center_y/axis_*` 单位为像素；`valid` 为 `0/1`；`confidence` 为 `0–1`；时间戳为进程单调时钟纳秒，不能直接当作 Unix epoch。
+
+`pupil_report.json` 是面向交接和分析人员的结构化摘要。它同时列出原始 AVI、`*_pupil.csv`、`*_annotated.avi` 和 `*_pupil_preview.jpg` 的对应关系，以及本次使用的置信度阈值、中心容差和连续保持时间；每只眼还保存 `alignment_at_start` / `alignment_at_stop` 快照，记录录制门禁是否达标。原始视频仍是证据源，静帧和标注视频用于人工复核。
 
 ## `quality.json` 判读
 

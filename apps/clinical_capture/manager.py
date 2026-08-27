@@ -72,6 +72,9 @@ class ClinicalCaptureManager:
                 self._owners[camera.name],
                 detector_fps=self.config.pupil_detector_fps,
                 confidence_threshold=self.config.pupil_confidence_threshold,
+                alignment_hold_seconds=self.config.pupil_alignment_hold_seconds,
+                alignment_center_tolerance=self.config.pupil_alignment_center_tolerance,
+                alignment_max_age_seconds=self.config.pupil_alignment_max_age_seconds,
             )
             for index, camera in enumerate(self.config.cameras)
         }
@@ -123,6 +126,24 @@ class ClinicalCaptureManager:
                 "detector_fps": 0.0,
                 "valid_rate": 0.0,
                 "age_ms": None,
+                "frame_width": 0,
+                "frame_height": 0,
+                "geometry_ok": False,
+                "center_ok": False,
+                "guidance": None,
+                "alignment": {
+                    "state": "starting",
+                    "ready": False,
+                    "progress": 0.0,
+                    "hold_seconds": 0.0,
+                    "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                    "center_ok": False,
+                    "fresh": False,
+                    "age_ms": None,
+                    "confidence": 0.0,
+                    "threshold": self.config.pupil_confidence_threshold,
+                    "guidance": "正在等待瞳孔检测",
+                },
                 "error": None,
             },
         }
@@ -327,6 +348,20 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "guidance": "瞳孔算法不可用，请检查安装或查看日志",
+                            "alignment": {
+                                "state": "error",
+                                "ready": False,
+                                "progress": 0.0,
+                                "hold_seconds": 0.0,
+                                "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "center_ok": False,
+                                "fresh": False,
+                                "age_ms": None,
+                                "confidence": 0.0,
+                                "threshold": self.config.pupil_confidence_threshold,
+                                "guidance": "瞳孔算法不可用，请检查安装或查看日志",
+                            },
                             "error": f"瞳孔检测启动失败: {error}",
                         }
 
@@ -384,6 +419,47 @@ class ClinicalCaptureManager:
                     (blocking if spec.required else warnings).append(
                         f"{spec.name}: 黑帧 {float(item['black_percent']):.1f}%"
                     )
+            alignment_items: list[Mapping[str, Any]] = []
+            for spec in self.config.cameras:
+                if not spec.required:
+                    continue
+                item = cameras[spec.name]
+                if item.get("state") not in {"ready", "recording"}:
+                    continue
+                pupil = item.get("pupil") if isinstance(item.get("pupil"), Mapping) else {}
+                alignment = pupil.get("alignment") if isinstance(pupil.get("alignment"), Mapping) else {}
+                alignment_items.append(alignment)
+                if not self.config.simulate and not bool(alignment.get("ready")):
+                    guidance = str(
+                        alignment.get("guidance")
+                        or pupil.get("guidance")
+                        or "请根据实时预览调整相机，直到瞳孔置信度达标"
+                    )
+                    blocking.append(f"{spec.name}: {guidance}")
+
+            alignment_required = not self.config.simulate
+            alignment_ready = (
+                True
+                if not alignment_required
+                else bool(alignment_items) and all(bool(item.get("ready")) for item in alignment_items)
+            )
+            alignment_progress = (
+                1.0
+                if not alignment_required
+                else min((float(item.get("progress") or 0.0) for item in alignment_items), default=0.0)
+            )
+            alignment_guidance = (
+                "模拟模式：跳过真实瞳孔对准门禁"
+                if not alignment_required
+                else next(
+                    (
+                        str(item.get("guidance"))
+                        for item in alignment_items
+                        if not bool(item.get("ready")) and item.get("guidance")
+                    ),
+                    "请根据双眼实时预览调整相机，等待瞳孔置信度达标",
+                )
+            )
             ready = not blocking and self._state in {SessionState.READY, SessionState.RECORDING}
             return {
                 "ready": ready,
@@ -392,6 +468,14 @@ class ClinicalCaptureManager:
                 "blocking_reasons": blocking,
                 "warnings": warnings,
                 "cameras": cameras,
+                "pupil_alignment": {
+                    "required": alignment_required,
+                    "ready": alignment_ready,
+                    "progress": round(max(0.0, min(1.0, alignment_progress)), 3),
+                    "hold_seconds": self.config.pupil_alignment_hold_seconds,
+                    "confidence_threshold": self.config.pupil_confidence_threshold,
+                    "guidance": alignment_guidance,
+                },
             }
 
     def start_session(self, metadata: SessionMetadata | Mapping[str, Any]) -> SessionRecord:
@@ -434,6 +518,20 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "guidance": "瞳孔数据文件创建失败，请检查会话目录权限",
+                            "alignment": {
+                                "state": "error",
+                                "ready": False,
+                                "progress": 0.0,
+                                "hold_seconds": 0.0,
+                                "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "center_ok": False,
+                                "fresh": False,
+                                "age_ms": None,
+                                "confidence": 0.0,
+                                "threshold": self.config.pupil_confidence_threshold,
+                                "guidance": "瞳孔数据文件创建失败，请检查会话目录权限",
+                            },
                             "error": f"瞳孔数据文件创建失败: {error}",
                         }
             assert self._record_event is not None

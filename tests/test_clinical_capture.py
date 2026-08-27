@@ -4,6 +4,7 @@ import json
 import hashlib
 from pathlib import Path
 import tempfile
+import time
 import unittest
 import zipfile
 
@@ -18,13 +19,59 @@ from apps.clinical_capture.camera_settings import (
 )
 from apps.clinical_capture.exporter import export_session
 from apps.clinical_capture.manager import ClinicalCaptureManager
-from apps.clinical_capture.models import CameraConfig, ClinicalConfig, SessionMetadata
+from apps.clinical_capture.models import CameraConfig, ClinicalConfig, SessionMetadata, SessionState
+from apps.clinical_capture.pupil import PupilDetectorService, _alignment_guidance
 from apps.clinical_capture.server import create_app
 from apps.clinical_capture.storage import SessionStore
 from apps.clinical_capture.worker import _close_recording, _open_recording, normalize_frame
+from apps.multicamera_capture.shared_frame import FrameSnapshot
 
 
 class ClinicalModelTests(unittest.TestCase):
+    def test_alignment_guidance_points_toward_the_offset(self) -> None:
+        message = _alignment_guidance(
+            "right_eye",
+            width=320,
+            height=240,
+            center_x=24.0,
+            center_y=210.0,
+            confidence=0.35,
+            threshold=0.6,
+            geometry_ok=True,
+            error=None,
+            center_tolerance=0.30,
+        )
+        self.assertIn("左、下", message)
+        self.assertIn("微调", message)
+
+    def test_pupil_alignment_requires_a_continuous_confident_hold(self) -> None:
+        class Detector:
+            def detect(self, _gray):
+                return {
+                    "confidence": 0.95,
+                    "ellipse": {"center": (32.0, 24.0), "axes": (18.0, 12.0), "angle": 0.0},
+                    "diameter": 15.0,
+                }
+
+        service = PupilDetectorService(
+            "right_eye",
+            0,
+            owner=None,  # _detect_snapshot is exercised directly with a deterministic frame.
+            alignment_hold_seconds=0.08,
+            alignment_max_age_seconds=0.5,
+        )
+        snapshot = FrameSnapshot(1, time.perf_counter_ns(), np.zeros((48, 64), dtype=np.uint8))
+        try:
+            service._detect_snapshot(snapshot, Detector())
+            first = service.status()["alignment"]
+            self.assertFalse(first["ready"])
+            self.assertEqual(first["state"], "holding")
+            time.sleep(0.16)
+            self.assertTrue(service.status()["alignment"]["ready"])
+            self.assertAlmostEqual(service.status()["alignment"]["progress"], 1.0, places=2)
+        finally:
+            service.close()
+
     def test_default_configuration_keeps_camera_zero_valid(self) -> None:
         config = ClinicalConfig.defaults(simulate=True)
         self.assertEqual(config.cameras[1].index, 0)
@@ -230,20 +277,46 @@ class ClinicalExportTests(unittest.TestCase):
 
             self.assertEqual(hashlib.sha256(video_path.read_bytes()).hexdigest(), raw_hash)
             self.assertTrue((record.path / "right_eye_annotated.avi").exists())
+            self.assertTrue((record.path / "right_eye_pupil_preview.jpg").exists())
+            self.assertIsNotNone(cv2.imread(str(record.path / "right_eye_pupil_preview.jpg")))
+            pupil_report = json.loads((record.path / "pupil_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(pupil_report["session_id"], record.session_id)
+            self.assertEqual(pupil_report["eyes"]["right_eye"]["valid_samples"], 1)
             manifest = json.loads((record.path / "export_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["manifest_self_excluded"])
             inventory = {item["path"]: item for item in manifest["files"]}
             self.assertEqual(inventory["right_eye.avi"]["kind"], "raw_video")
             self.assertEqual(inventory["right_eye.avi"]["sha256"], raw_hash)
             self.assertEqual(inventory["right_eye_annotated.avi"]["kind"], "annotated_video")
+            self.assertEqual(inventory["right_eye_pupil_preview.jpg"]["kind"], "annotated_image")
+            self.assertEqual(inventory["pupil_report.json"]["kind"], "pupil_report")
             with zipfile.ZipFile(archive_path) as archive:
                 names = set(archive.namelist())
             self.assertIn("right_eye.avi", names)
             self.assertIn("right_eye_annotated.avi", names)
+            self.assertIn("right_eye_pupil_preview.jpg", names)
+            self.assertIn("pupil_report.json", names)
             self.assertIn("export_manifest.json", names)
 
 
 class ClinicalManagerSimulationTests(unittest.TestCase):
+    def test_backend_rejects_start_when_pupil_alignment_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            manager = ClinicalCaptureManager(ClinicalConfig.defaults(data_dir=root, simulate=False))
+            metadata = SessionMetadata.from_mapping(
+                {"subject_code": "P7", "visit_id": "V1", "operator": "Dr", "consent_confirmed": True}
+            )
+            manager._state = SessionState.READY
+            manager.preflight = lambda: {
+                "ready": False,
+                "blocking_reasons": ["right_eye: 请将右眼整只瞳孔移入画面"],
+            }
+            try:
+                with self.assertRaisesRegex(RuntimeError, "整只瞳孔"):
+                    manager.start_session(metadata)
+            finally:
+                manager.close()
+
     def test_unconfirmed_real_device_mapping_blocks_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             manager = ClinicalCaptureManager(

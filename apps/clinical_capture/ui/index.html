@@ -118,10 +118,12 @@
                 <h3>ZIP 文件说明</h3>
                 <dl>
                   <div><dt><code>*_annotated.avi</code></dt><dd>带瞳孔轮廓、中心、置信度、延迟和帧号的复核视频</dd></div>
+                  <div><dt><code>*_pupil_preview.jpg</code></dt><dd>带瞳孔轮廓、中心和置信度的代表性复核静帧</dd></div>
                   <div><dt><code>*.avi</code></dt><dd>按所选方向保存的原始视频，不烧录识别图层</dd></div>
                   <div><dt><code>*_frames.csv</code></dt><dd>每个写入帧的序号与采集时间戳</dd></div>
                   <div><dt><code>*_pupil.csv</code></dt><dd>瞳孔有效性、几何参数、置信度与识别延迟</dd></div>
                   <div><dt><code>quality.json</code></dt><dd>双眼帧率、黑帧比例和录制质量检查</dd></div>
+                  <div><dt><code>pupil_report.json</code></dt><dd>双眼检测有效率、置信度统计、对准门禁证据和复核文件索引</dd></div>
                   <div><dt><code>config.json / session.json</code></dt><dd>物理相机映射、画面方向、采集模式与会话信息</dd></div>
                   <div><dt><code>analysis_ready.csv</code></dt><dd>便于统计软件读取的双眼汇总表</dd></div>
                   <div><dt><code>export_manifest.json</code></dt><dd>完整文件清单、用途、字节数和 SHA-256 校验值（清单自身不纳入哈希）</dd></div>

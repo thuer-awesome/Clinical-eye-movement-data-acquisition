@@ -33,10 +33,14 @@ Export file guide
 the source recordings and never contain a computer-vision overlay.
 *_annotated.avi: review copies with the pupil outline, center, confidence,
 latency, eye role, and frame number burned in.
+*_pupil_preview.jpg: a representative annotated still image for quick review
+without opening the video editor.
 *_frames.csv: one row per written video frame with capture sequence and
 monotonic timestamp.
 *_pupil.csv: pupil validity, geometry, confidence, and detector latency for
 each detector sample.
+pupil_report.json: structured per-eye detection summary, confidence statistics,
+alignment-gate settings, and links to the review artifacts.
 quality.json: per-camera frame-rate, black-frame, and recording quality checks.
 config.json / session.json: camera mapping, orientation, capture mode, and
 de-identified session metadata.
@@ -70,6 +74,10 @@ _KNOWN_FILES = {
         "analysis_table",
         "One-row-per-camera summary intended for analysis import.",
     ),
+    "pupil_report.json": (
+        "pupil_report",
+        "Structured per-eye pupil detection summary and alignment-gate provenance; not a diagnostic report.",
+    ),
     "screening.json": (
         "screening_note",
         "Optional research/screening note; not a diagnostic report.",
@@ -99,6 +107,10 @@ def export_session(store: SessionStore, session_id: str) -> Path:
                 warnings.append(f"{eye_name} annotation failed: {error}")
 
         _write_session_readme(root)
+        try:
+            build_pupil_report(root, session_id)
+        except Exception as error:  # report generation must not hide raw data
+            warnings.append(f"瞳孔报告生成失败: {error}")
         build_manifest(root, session_id, warnings)
         return store.export_zip(session_id)
 
@@ -109,6 +121,7 @@ def annotate_video(root: Path, eye_name: str) -> Path | None:
     target = root / f"{eye_name}_annotated.avi"
     frames_path = root / f"{eye_name}_frames.csv"
     pupil_path = root / f"{eye_name}_pupil.csv"
+    preview_target = root / f"{eye_name}_pupil_preview.jpg"
     if not source.exists():
         return None
 
@@ -117,7 +130,13 @@ def annotate_video(root: Path, eye_name: str) -> Path | None:
         (path.stat().st_mtime_ns for path in inputs if path.exists()),
         default=0,
     )
-    if target.exists() and target.stat().st_mtime_ns >= newest_input and _playable_video(target):
+    if (
+        target.exists()
+        and preview_target.exists()
+        and target.stat().st_mtime_ns >= newest_input
+        and preview_target.stat().st_mtime_ns >= newest_input
+        and _playable_video(target)
+    ):
         return target
 
     capture = cv2.VideoCapture(str(source))
@@ -166,6 +185,8 @@ def annotate_video(root: Path, eye_name: str) -> Path | None:
     frame_count = 0
     detection_position = 0
     current: dict[str, Any] | None = None
+    preview_frame: Any | None = None
+    preview_valid = False
     completed = False
     try:
         while True:
@@ -193,15 +214,17 @@ def annotate_video(root: Path, eye_name: str) -> Path | None:
                     if timestamp and current_timestamp
                     else True
                 )
-            writer.write(
-                _draw_annotation(
-                    frame,
-                    current,
-                    valid=valid,
-                    frame_index=frame_count,
-                    eye_name=eye_name,
-                )
+            annotated = _draw_annotation(
+                frame,
+                current,
+                valid=valid,
+                frame_index=frame_count,
+                eye_name=eye_name,
             )
+            if preview_frame is None or (valid and not preview_valid):
+                preview_frame = annotated.copy()
+                preview_valid = valid
+            writer.write(annotated)
             frame_count += 1
         completed = frame_count > 0
     finally:
@@ -214,7 +237,28 @@ def annotate_video(root: Path, eye_name: str) -> Path | None:
         temporary.unlink(missing_ok=True)
         return None
     os.replace(temporary, target)
+    if preview_frame is not None:
+        _write_preview_image(preview_target, preview_frame)
     return target
+
+
+def _write_preview_image(target: Path, frame: Any) -> None:
+    """Write one representative annotated frame atomically for quick review."""
+    temporary = target.with_name(
+        f"{target.stem}.tmp.{os.getpid()}.{threading.get_ident()}{target.suffix}"
+    )
+    try:
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+        )
+        if not ok:
+            raise RuntimeError("OpenCV could not encode the pupil preview image")
+        temporary.write_bytes(bytes(encoded))
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _playable_video(path: Path, *, expected_frames: int | None = None) -> bool:
@@ -371,6 +415,97 @@ def _write_session_readme(root: Path) -> None:
         pass
 
 
+def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
+    """Write a compact, machine-readable pupil review report for the session."""
+    config: dict[str, Any] = {}
+    session: dict[str, Any] = {}
+    try:
+        config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    try:
+        session = json.loads((root / "session.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+
+    camera_stats = session.get("camera_stats") if isinstance(session, Mapping) else {}
+    if not isinstance(camera_stats, Mapping):
+        camera_stats = {}
+    threshold_value = _number(config, "pupil_confidence_threshold", 0.6)
+    threshold = 0.6 if threshold_value is None else threshold_value
+    eyes: dict[str, dict[str, Any]] = {}
+    for eye_name in ("right_eye", "left_eye"):
+        rows = _read_rows(root / f"{eye_name}_pupil.csv")
+        confidences = [
+            value
+            for value in (_number(row, "confidence") for row in rows)
+            if value is not None
+        ]
+        valid_count = sum(1 for row in rows if _truthy(row.get("valid")))
+        timestamps = [
+            value
+            for value in (_integer(row, "capture_timestamp_ns", 0) for row in rows)
+            if value > 0
+        ]
+        detector_summary = camera_stats.get(eye_name, {})
+        if not isinstance(detector_summary, Mapping):
+            detector_summary = {}
+        pupil_summary = detector_summary.get("pupil", {})
+        if not isinstance(pupil_summary, Mapping):
+            pupil_summary = {}
+        eyes[eye_name] = {
+            "pupil_csv": f"{eye_name}_pupil.csv" if rows or (root / f"{eye_name}_pupil.csv").exists() else None,
+            "annotated_video": f"{eye_name}_annotated.avi" if (root / f"{eye_name}_annotated.avi").exists() else None,
+            "annotated_preview": f"{eye_name}_pupil_preview.jpg" if (root / f"{eye_name}_pupil_preview.jpg").exists() else None,
+            "samples": len(rows),
+            "valid_samples": valid_count,
+            "valid_rate_percent": round(100.0 * valid_count / max(1, len(rows)), 2),
+            "confidence_threshold": round(float(threshold), 4),
+            "confidence_min": round(min(confidences), 4) if confidences else None,
+            "confidence_mean": round(sum(confidences) / len(confidences), 4) if confidences else None,
+            "confidence_max": round(max(confidences), 4) if confidences else None,
+            "capture_start_timestamp_ns": min(timestamps) if timestamps else None,
+            "capture_end_timestamp_ns": max(timestamps) if timestamps else None,
+            "detector_fps": pupil_summary.get("detector_fps"),
+            "latency_p95_ms": pupil_summary.get("latency_p95_ms"),
+            "alignment_at_start": pupil_summary.get("alignment_at_start", {}),
+            "alignment_at_stop": pupil_summary.get("alignment_at_stop", {}),
+        }
+
+    report = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "purpose": "Pupil detection and camera-alignment review for research/screening; not a diagnostic report.",
+        "alignment_gate": {
+            "required": not bool(config.get("simulate", False)),
+            "hold_seconds": config.get("pupil_alignment_hold_seconds", 1.5),
+            "center_tolerance": config.get("pupil_alignment_center_tolerance", 0.30),
+            "max_detection_age_seconds": config.get("pupil_alignment_max_age_seconds", 0.75),
+            "confidence_threshold": threshold,
+        },
+        "eyes": eyes,
+        "artifacts": {
+            "raw_videos": [
+                f"{eye_name}.avi"
+                for eye_name in ("right_eye", "left_eye")
+                if (root / f"{eye_name}.avi").exists()
+            ],
+            "detection_csv": [
+                f"{eye_name}_pupil.csv"
+                for eye_name in ("right_eye", "left_eye")
+                if (root / f"{eye_name}_pupil.csv").exists()
+            ],
+        },
+        "disclaimer": "仅供研究/筛查记录和设备对准复核，不构成临床诊断或治疗建议。",
+    }
+    target = root / "pupil_report.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
+    return report
+
+
 def build_manifest(root: Path, session_id: str, warnings: list[str] | None = None) -> dict[str, Any]:
     """Write a manifest with provenance and hashes for every session artifact."""
     files: list[dict[str, Any]] = []
@@ -401,6 +536,11 @@ def build_manifest(root: Path, session_id: str, warnings: list[str] | None = Non
             kind, description = (
                 "pupil_detection",
                 "Detector output for the newest frame at each detector sample, including validity, geometry, confidence, and latency.",
+            )
+        elif relative.endswith("_pupil_preview.jpg"):
+            kind, description = (
+                "annotated_image",
+                "Representative still image with timestamp-aligned pupil outline, center, confidence, and eye role.",
             )
         else:
             kind, description = (
@@ -454,6 +594,10 @@ def build_manifest(root: Path, session_id: str, warnings: list[str] | None = Non
         "purpose": "Clinical Capture export inventory and provenance. This package is for research/screening review and is not a diagnostic report.",
         "camera_mapping": camera_mapping,
         "annotated_videos": annotated_videos,
+        "pupil_report": {
+            "file": "pupil_report.json" if (root / "pupil_report.json").exists() else None,
+            "available": (root / "pupil_report.json").exists(),
+        },
         "warnings": list(warnings or []),
         "manifest_self_excluded": True,
         "files": files,
