@@ -282,6 +282,9 @@ class ClinicalExportTests(unittest.TestCase):
             pupil_report = json.loads((record.path / "pupil_report.json").read_text(encoding="utf-8"))
             self.assertEqual(pupil_report["session_id"], record.session_id)
             self.assertEqual(pupil_report["eyes"]["right_eye"]["valid_samples"], 1)
+            clinical_report = json.loads((record.path / "clinical_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(clinical_report["session_id"], record.session_id)
+            self.assertEqual(clinical_report["quality"]["cameras"]["right_eye"]["recorded_frames"], 5)
             manifest = json.loads((record.path / "export_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["manifest_self_excluded"])
             inventory = {item["path"]: item for item in manifest["files"]}
@@ -290,12 +293,14 @@ class ClinicalExportTests(unittest.TestCase):
             self.assertEqual(inventory["right_eye_annotated.avi"]["kind"], "annotated_video")
             self.assertEqual(inventory["right_eye_pupil_preview.jpg"]["kind"], "annotated_image")
             self.assertEqual(inventory["pupil_report.json"]["kind"], "pupil_report")
+            self.assertEqual(inventory["clinical_report.json"]["kind"], "clinical_report")
             with zipfile.ZipFile(archive_path) as archive:
                 names = set(archive.namelist())
             self.assertIn("right_eye.avi", names)
             self.assertIn("right_eye_annotated.avi", names)
             self.assertIn("right_eye_pupil_preview.jpg", names)
             self.assertIn("pupil_report.json", names)
+            self.assertIn("clinical_report.json", names)
             self.assertIn("export_manifest.json", names)
 
 

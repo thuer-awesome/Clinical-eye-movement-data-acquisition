@@ -14,14 +14,14 @@ Clinical Capture 是面向临床研究和筛查记录的 Windows 双眼眼部相
 - 首次使用扫描相机，明确保存物理索引和画面方向；更换 USB 口或相机后可重新映射。
 - 预检显示驱动实际宽高、FPS、FOURCC、黑帧比例、帧流超时和写盘状态；低帧率重启是有限的，不会无限重试。
 - 录制前要求双眼瞳孔达到置信度阈值并连续稳定保持；未对准时按页面提示向左/右/上/下微调相机，后端也会阻止绕过 UI 开始录制。
-- 结束时生成 `quality.json`、`analysis_ready.csv`、`*_pupil.csv`，导出时保留原始证据并生成带瞳孔轮廓的复核视频、代表性静帧、`pupil_report.json` 和 SHA-256 清单。
+- 结束时生成 `quality.json`、`analysis_ready.csv`、`*_pupil.csv`，导出时保留原始证据并生成带瞳孔轮廓的复核视频、代表性静帧、`pupil_report.json`、面向医生的 `clinical_report.json` 和 SHA-256 清单。
 - 受试者编号、访视编号和操作员字段强制脱敏格式；必须确认知情同意后才可开始。
 
 ## 先给医生
 
 从 GitHub Actions 的 Windows 构建产物或 Release 下载 `ClinicalCapture-portable.zip`，完整解压后双击目录内的 `ClinicalCapture.exe`（也可双击 `ClinicalCapture-Start.cmd`）。不需要安装 Python、Node 或打开 VSCode。
 
-第一次在一台电脑上使用：点击“扫描相机”→根据缩略图分别设为右眼/左眼→确认方向→“保存并重启相机”。正式采集前还要根据每只眼实时提示把瞳孔移入中心，等待“对准完成”后开始按钮才会启用。结束后先看质量指标和 `pupil_report.json`，再在“已完成会话”中导出 ZIP。详细步骤见 [临床操作 SOP](docs/clinical-sop.md) 和 [Windows 安装](docs/installation.md)。
+第一次在一台电脑上使用：点击“扫描相机”→根据缩略图分别设为右眼/左眼→确认方向→“保存并重启相机”。正式采集前还要根据每只眼实时提示把瞳孔移入中心，等待“对准完成”后开始按钮才会启用。结束后先看质量指标、`pupil_report.json` 和 `clinical_report.json`，再在“已完成会话”中导出 ZIP。详细步骤见 [临床操作 SOP](docs/clinical-sop.md) 和 [Windows 安装](docs/installation.md)。
 
 默认数据目录为 `%LOCALAPPDATA%\\ClinicalCapture\\data`。不要只复制一个 `.exe`；PyInstaller onedir 运行需要同目录的 `_internal` 文件。
 

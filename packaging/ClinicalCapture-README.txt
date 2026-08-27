@@ -15,7 +15,7 @@ Clinical Capture 临床高速采集工作站
 默认数据目录：
 %LOCALAPPDATA%\ClinicalCapture\data
 
-导出包包括：双眼原始 AVI、带瞳孔标注 AVI、瞳孔复核静帧、逐帧时间戳、实时瞳孔结果 CSV、pupil_report.json、质量报告、analysis_ready.csv、会话配置和筛查备注。
+导出包包括：双眼原始 AVI、带瞳孔标注 AVI、瞳孔复核静帧、逐帧时间戳、实时瞳孔结果 CSV、pupil_report.json、clinical_report.json、质量报告、analysis_ready.csv、会话配置和筛查备注。
 文件说明：
 - right_eye.avi / left_eye.avi：按采集时方向保存的原始证据视频，不含识别图层。
 - right_eye_annotated.avi / left_eye_annotated.avi：带瞳孔轮廓、中心、置信度、延迟和帧号的复核视频。
@@ -23,6 +23,7 @@ Clinical Capture 临床高速采集工作站
 - *_frames.csv：每个写入视频帧的采集序号和时间戳，用于逐帧对齐。
 - *_pupil.csv：瞳孔检测有效性、椭圆参数、置信度和算法延迟。
 - pupil_report.json：每只眼检测样本、有效率、置信度统计、对准门禁参数和复核文件索引；不是诊断报告。
+- clinical_report.json：医生查看用的脱敏会话、双眼质量、瞳孔质量、筛查备注和复核文件总览；不是诊断报告。
 - quality.json：实际帧率、黑帧比例和写盘质量检查。
 - config.json / session.json：物理相机映射、画面方向、请求模式和脱敏会话信息。
 - analysis_ready.csv：便于统计软件读取的双眼汇总表。

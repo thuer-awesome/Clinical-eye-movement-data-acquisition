@@ -41,6 +41,8 @@ monotonic timestamp.
 each detector sample.
 pupil_report.json: structured per-eye detection summary, confidence statistics,
 alignment-gate settings, and links to the review artifacts.
+clinical_report.json: clinician-facing de-identified session summary with
+camera quality, pupil quality, screening note, and artifact links.
 quality.json: per-camera frame-rate, black-frame, and recording quality checks.
 config.json / session.json: camera mapping, orientation, capture mode, and
 de-identified session metadata.
@@ -78,6 +80,10 @@ _KNOWN_FILES = {
         "pupil_report",
         "Structured per-eye pupil detection summary and alignment-gate provenance; not a diagnostic report.",
     ),
+    "clinical_report.json": (
+        "clinical_report",
+        "De-identified clinical acquisition summary with camera quality, pupil quality, and artifact links; not a diagnostic report.",
+    ),
     "screening.json": (
         "screening_note",
         "Optional research/screening note; not a diagnostic report.",
@@ -111,6 +117,10 @@ def export_session(store: SessionStore, session_id: str) -> Path:
             build_pupil_report(root, session_id)
         except Exception as error:  # report generation must not hide raw data
             warnings.append(f"瞳孔报告生成失败: {error}")
+        try:
+            build_clinical_report(root, session_id)
+        except Exception as error:  # report generation must not hide raw data
+            warnings.append(f"临床报告生成失败: {error}")
         build_manifest(root, session_id, warnings)
         return store.export_zip(session_id)
 
@@ -506,6 +516,81 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
     return report
 
 
+def build_clinical_report(root: Path, session_id: str) -> dict[str, Any]:
+    """Write the clinician-facing summary without adding diagnostic claims."""
+    session: dict[str, Any] = {}
+    quality: dict[str, Any] = {}
+    pupil_report: dict[str, Any] = {}
+    for name, target in (
+        ("session.json", "session"),
+        ("quality.json", "quality"),
+        ("pupil_report.json", "pupil_report"),
+    ):
+        try:
+            value = json.loads((root / name).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            value = {}
+        if target == "session":
+            session = value if isinstance(value, dict) else {}
+        elif target == "quality":
+            quality = value if isinstance(value, dict) else {}
+        else:
+            pupil_report = value if isinstance(value, dict) else {}
+
+    metadata = session.get("metadata") if isinstance(session.get("metadata"), Mapping) else {}
+    cameras = quality.get("cameras") if isinstance(quality.get("cameras"), Mapping) else {}
+    report = {
+        "schema_version": 1,
+        "session_id": session_id,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": session.get("state", "unknown"),
+        "metadata": {
+            "subject_code": metadata.get("subject_code"),
+            "visit_id": metadata.get("visit_id"),
+            "operator": metadata.get("operator"),
+            "protocol": metadata.get("protocol"),
+            "age": metadata.get("age"),
+            "sex": metadata.get("sex"),
+            "consent_confirmed": metadata.get("consent_confirmed"),
+        },
+        "quality": {
+            "overall": quality.get("overall", {}),
+            "cameras": cameras,
+        },
+        "pupil": {
+            "alignment_gate": pupil_report.get("alignment_gate", {}),
+            "eyes": pupil_report.get("eyes", {}),
+        },
+        "screening": session.get("screening_result"),
+        "artifacts": {
+            "raw_videos": [
+                f"{eye_name}.avi"
+                for eye_name in ("right_eye", "left_eye")
+                if (root / f"{eye_name}.avi").exists()
+            ],
+            "annotated_videos": [
+                f"{eye_name}_annotated.avi"
+                for eye_name in ("right_eye", "left_eye")
+                if (root / f"{eye_name}_annotated.avi").exists()
+            ],
+            "annotated_images": [
+                f"{eye_name}_pupil_preview.jpg"
+                for eye_name in ("right_eye", "left_eye")
+                if (root / f"{eye_name}_pupil_preview.jpg").exists()
+            ],
+            "pupil_report": "pupil_report.json" if (root / "pupil_report.json").exists() else None,
+            "clinical_report": "clinical_report.json",
+            "quality_report": "quality.json" if (root / "quality.json").exists() else None,
+        },
+        "disclaimer": "仅供临床研究/筛查采集质量复核，不构成临床诊断、治疗或风险分层结论。",
+    }
+    target = root / "clinical_report.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
+    return report
+
+
 def build_manifest(root: Path, session_id: str, warnings: list[str] | None = None) -> dict[str, Any]:
     """Write a manifest with provenance and hashes for every session artifact."""
     files: list[dict[str, Any]] = []
@@ -597,6 +682,10 @@ def build_manifest(root: Path, session_id: str, warnings: list[str] | None = Non
         "pupil_report": {
             "file": "pupil_report.json" if (root / "pupil_report.json").exists() else None,
             "available": (root / "pupil_report.json").exists(),
+        },
+        "clinical_report": {
+            "file": "clinical_report.json" if (root / "clinical_report.json").exists() else None,
+            "available": (root / "clinical_report.json").exists(),
         },
         "warnings": list(warnings or []),
         "manifest_self_excluded": True,

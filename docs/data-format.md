@@ -16,6 +16,7 @@
 | `*_frames.csv` | 有相机时必需 | `frame_index`、`capture_sequence`、`timestamp_ns`、UTC 墙上时间 |
 | `*_pupil.csv` | 检测启用时生成 | Detector2D 结果、有效性、椭圆几何、置信度和延迟 |
 | `pupil_report.json` | 导出时生成 | 每只眼检测样本/有效率/置信度统计、对准门禁参数和复核文件索引；不是诊断报告 |
+| `clinical_report.json` | 导出时生成 | 面向医生的脱敏会话摘要、双眼质量、瞳孔质量、筛查备注和所有复核文件索引；不是诊断报告 |
 | `screening.json` | 可选 | 研究/筛查标签、分数和备注；带非诊断免责声明 |
 | `README.txt` | 必需 | 会话目录内自包含说明 |
 | `export_manifest.json` | 导出时生成 | 文件用途、大小、SHA-256、相机映射和标注文件可用性 |
@@ -27,6 +28,8 @@
 `center_x/center_y/axis_*` 单位为像素；`valid` 为 `0/1`；`confidence` 为 `0–1`；时间戳为进程单调时钟纳秒，不能直接当作 Unix epoch。
 
 `pupil_report.json` 是面向交接和分析人员的结构化摘要。它同时列出原始 AVI、`*_pupil.csv`、`*_annotated.avi` 和 `*_pupil_preview.jpg` 的对应关系，以及本次使用的置信度阈值、中心容差和连续保持时间；每只眼还保存 `alignment_at_start` / `alignment_at_stop` 快照，记录录制门禁是否达标。原始视频仍是证据源，静帧和标注视频用于人工复核。
+
+`clinical_report.json` 是面向医生/临床协调员的单文件摘要，包含脱敏会话字段、`quality.json` 的整体和逐眼质量、`pupil_report.json` 的瞳孔统计及筛查备注。它不替代原始视频、逐帧 CSV 或正式临床报告，也不生成诊断结论。
 
 ## `quality.json` 判读
 
