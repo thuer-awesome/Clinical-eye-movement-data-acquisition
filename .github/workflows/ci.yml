@@ -41,7 +41,7 @@ jobs:
           & .\.venv\Scripts\python.exe -m pip install -r requirements-clinical-capture.txt
       - name: Build portable workstation
         shell: pwsh
-        run: .\scripts\build_clinical_capture.ps1 -SkipInstall -PythonPath (Get-Command python).Source
+        run: .\scripts\build_clinical_capture.ps1 -SkipInstall -PythonPath (Resolve-Path .\.venv\Scripts\python.exe)
       - name: Upload portable package
         uses: actions/upload-artifact@v4
         with:
