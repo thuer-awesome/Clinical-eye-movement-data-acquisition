@@ -147,6 +147,9 @@ def recording_gate_status(
     reasons: list[str] = []
     app_state = str(status.get("app_state") or "starting")
     simulate = bool(status.get("simulate"))
+    status_error = str(status.get("status_error") or "").strip()
+    if status_error:
+        reasons.append(f"本地服务状态读取失败：{status_error}")
 
     if busy:
         reasons.append("正在处理上一项操作，请稍候")
@@ -175,7 +178,8 @@ def recording_gate_status(
         settings = status.get("device_settings")
         settings_confirmed = isinstance(settings, Mapping) and bool(settings.get("confirmed"))
         if (
-            not simulate
+            not status_error
+            and not simulate
             and not settings_confirmed
             and not any("映射" in reason or "画面方向" in reason for reason in reasons)
         ):
@@ -184,7 +188,8 @@ def recording_gate_status(
         preflight = status.get("preflight")
         alignment = preflight.get("pupil_alignment") if isinstance(preflight, Mapping) else None
         if (
-            isinstance(alignment, Mapping)
+            not status_error
+            and isinstance(alignment, Mapping)
             and alignment.get("required")
             and not alignment.get("ready")
             and not any("瞳孔" in reason or "对准" in reason for reason in reasons)
@@ -265,6 +270,101 @@ def recording_reason_label(reason: Any) -> str:
         if text.startswith(prefix):
             return f"{camera_label(role)}：{text[len(prefix):].lstrip()}"
     return text
+
+
+def status_failure_payload(
+    error: Any,
+    *,
+    previous_status: Mapping[str, Any] | None = None,
+    simulate: bool = False,
+    camera_names: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Build a fail-closed status when the manager cannot be queried.
+
+    The payload intentionally looks like a normal manager status so the
+    existing renderer and recording gate can consume it without a second UI
+    error path.  A known active recording state is retained so the operator
+    can still stop and save it; starting a new session remains impossible.
+    """
+    previous = previous_status if isinstance(previous_status, Mapping) else {}
+    if "simulate" in previous:
+        simulate = bool(previous.get("simulate"))
+    detail = str(error).strip() or error.__class__.__name__
+    reason = f"本地服务状态读取失败：{detail}"
+    previous_state = str(previous.get("app_state") or "")
+    active = previous_state in {"recording", "stopping"} or bool(previous.get("session"))
+    app_state = previous_state if active else "error"
+
+    old_preflight = previous.get("preflight")
+    old_cameras = old_preflight.get("cameras") if isinstance(old_preflight, Mapping) else {}
+    names = list(camera_names)
+    if isinstance(old_cameras, Mapping):
+        for name in old_cameras:
+            if str(name) not in names:
+                names.append(str(name))
+    cameras: dict[str, dict[str, Any]] = {}
+    for name in names:
+        old = old_cameras.get(name) if isinstance(old_cameras, Mapping) else None
+        item = dict(old) if isinstance(old, Mapping) else {}
+        item.update(
+            {
+                "name": name,
+                "state": "error",
+                "error": reason,
+                "capture_fps": 0.0,
+                "last_frame_age_ms": None,
+            }
+        )
+        old_pupil = item.get("pupil") if isinstance(item.get("pupil"), Mapping) else {}
+        old_alignment = old_pupil.get("alignment") if isinstance(old_pupil.get("alignment"), Mapping) else {}
+        try:
+            threshold = float(old_alignment.get("threshold") or old_pupil.get("threshold") or 0.6)
+        except (TypeError, ValueError):
+            threshold = 0.6
+        item["pupil"] = {
+            "state": "error",
+            "valid": False,
+            "confidence": 0.0,
+            "latency_ms": None,
+            "age_ms": None,
+            "guidance": reason,
+            "alignment": {
+                "state": "error",
+                "ready": False,
+                "progress": 0.0,
+                "fresh": False,
+                "confidence": 0.0,
+                "threshold": threshold,
+                "guidance": reason,
+            },
+        }
+        cameras[name] = item
+
+    return {
+        "app_state": app_state,
+        "status_error": detail,
+        "last_error": reason,
+        "simulate": bool(simulate),
+        "uptime_s": previous.get("uptime_s", 0.0),
+        "data_dir": previous.get("data_dir"),
+        "session": previous.get("session") if active else None,
+        "last_session": previous.get("last_session"),
+        "preflight": {
+            "ready": False,
+            "state": "error",
+            "blocking_reasons": [reason],
+            "warnings": [],
+            "cameras": cameras,
+            "pupil_alignment": {
+                "required": not bool(simulate),
+                "ready": False,
+                "progress": 0.0,
+                "guidance": reason,
+                "confidence_threshold": 0.6,
+            },
+        },
+        "device_settings": {"confirmed": False, "error": reason},
+    }
 
 
 def _binding_issues(status_payload: Mapping[str, Any], *, stale_timeout_ms: float = 2500.0) -> list[str]:
@@ -640,6 +740,10 @@ if QT_AVAILABLE:
             self.setMinimumSize(1100, 760)
             self._build_ui()
             self._apply_styles()
+            # The manager has not returned a status yet.  Initialize the
+            # controls from an empty (therefore fail-closed) gate before the
+            # window can receive user input.
+            self._update_controls()
             interval = max(50, round(1000.0 / max(1, manager.config.preview_fps)))
             self._status_timer = QTimer(self)
             self._status_timer.setInterval(250)
@@ -933,7 +1037,20 @@ if QT_AVAILABLE:
             try:
                 status = self.manager.status()
             except Exception as error:
-                self.connection_chip.setText(f"本地服务：错误 · {error}")
+                detail = str(error).strip() or error.__class__.__name__
+                camera_names = tuple(
+                    str(camera.name)
+                    for camera in getattr(getattr(self.manager, "config", None), "cameras", ())
+                    if getattr(camera, "name", None)
+                )
+                self._status = status_failure_payload(
+                    error,
+                    previous_status=self._status,
+                    simulate=bool(getattr(getattr(self.manager, "config", None), "simulate", False)),
+                    camera_names=camera_names,
+                )
+                self.operation_label.setText(f"状态读取失败：{detail}")
+                self._render_status()
                 return
             self._status = status
             self._render_status()
@@ -962,7 +1079,10 @@ if QT_AVAILABLE:
             preflight = status.get("preflight") if isinstance(status.get("preflight"), Mapping) else {}
             self.mode_chip.setText(f"模式：{'模拟' if simulate else '现场'}")
             self.state_chip.setText(f"状态：{state_label(app_state)}")
-            self.connection_chip.setText("本地服务：在线")
+            status_error = str(status.get("status_error") or "").strip()
+            self.connection_chip.setText(
+                f"本地服务：错误 · {status_error}" if status_error else "本地服务：在线"
+            )
             settings = status.get("device_settings") if isinstance(status.get("device_settings"), Mapping) else {}
             confirmed = bool(settings.get("confirmed")) or simulate
             self.device_status_label.setText(

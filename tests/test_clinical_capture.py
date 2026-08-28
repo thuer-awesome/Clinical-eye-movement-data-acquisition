@@ -32,6 +32,7 @@ from apps.clinical_capture.qt_app import (
     recording_gate_reasons,
     recording_reason_label,
     recording_gate_status,
+    status_failure_payload,
 )
 from apps.clinical_capture.server import create_app
 from apps.clinical_capture.storage import SessionStore
@@ -160,6 +161,52 @@ class ClinicalModelTests(unittest.TestCase):
         )
         self.assertFalse(result["can_record"])
         self.assertTrue(any("当前会话正在录制或保存" in reason for reason in result["reasons"]))
+
+    def test_status_failure_payload_fails_closed_and_exposes_connection_error(self) -> None:
+        payload = status_failure_payload(
+            RuntimeError("status socket closed"),
+            previous_status={"app_state": "ready", "simulate": False},
+            camera_names=("right_eye", "left_eye"),
+        )
+        self.assertEqual(payload["app_state"], "error")
+        self.assertEqual(payload["status_error"], "status socket closed")
+        self.assertFalse(payload["preflight"]["ready"])
+        self.assertIn("本地服务状态读取失败：status socket closed", payload["preflight"]["blocking_reasons"])
+        self.assertEqual(set(payload["preflight"]["cameras"]), {"right_eye", "left_eye"})
+        gate = recording_gate_status(
+            payload,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(gate["can_record"])
+        self.assertTrue(any("本地服务状态读取失败" in reason for reason in gate["reasons"]))
+        self.assertFalse(any("瞳孔对准未完成" in reason for reason in gate["reasons"]))
+
+    def test_status_failure_payload_keeps_stop_path_for_active_recording(self) -> None:
+        payload = status_failure_payload(
+            "temporary status failure",
+            previous_status={"app_state": "recording", "simulate": True, "session": {"session_id": "S1"}},
+            camera_names=("right_eye",),
+        )
+        self.assertEqual(payload["app_state"], "recording")
+        self.assertIsNotNone(payload["session"])
+
+    def test_empty_status_is_fail_closed_before_first_manager_poll(self) -> None:
+        result = recording_gate_status(
+            None,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertTrue(any("尚未收到设备预检结果" in reason for reason in result["reasons"]))
 
     def test_recording_gate_keeps_unspecified_mapping_and_alignment_visible(self) -> None:
         status = {
