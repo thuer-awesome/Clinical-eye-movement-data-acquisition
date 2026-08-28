@@ -875,9 +875,12 @@ class ClinicalCaptureManager:
                             reason = f"{camera.name} 采集进程异常，录制已安全结束"
                             break
                         age = item.get("last_frame_monotonic")
-                        if camera.required and age is not None and time.monotonic() - float(age) > self.config.stale_frame_timeout_seconds:
+                        if camera.required and (
+                            age is None
+                            or time.monotonic() - float(age) > self.config.stale_frame_timeout_seconds
+                        ):
                             should_abort = True
-                            reason = f"{camera.name} 帧流超时，录制已安全结束"
+                            reason = f"{camera.name} 帧流不可用或已超时，录制已安全结束"
                             break
             if should_abort:
                 self._abort_recording_async(reason)
