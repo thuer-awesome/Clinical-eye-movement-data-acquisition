@@ -24,7 +24,15 @@ from apps.clinical_capture.exporter import export_session
 from apps.clinical_capture.manager import ClinicalCaptureManager
 from apps.clinical_capture.models import CameraConfig, ClinicalConfig, SessionMetadata, SessionState
 from apps.clinical_capture.pupil import PupilDetectorService, _alignment_direction, _alignment_guidance, guide_rect_pixels
-from apps.clinical_capture.qt_app import QT_AVAILABLE, confidence_color_rgb, direction_label, guide_rect_normalized
+from apps.clinical_capture.qt_app import (
+    QT_AVAILABLE,
+    confidence_color_rgb,
+    direction_label,
+    guide_rect_normalized,
+    recording_gate_reasons,
+    recording_reason_label,
+    recording_gate_status,
+)
 from apps.clinical_capture.server import create_app
 from apps.clinical_capture.storage import SessionStore
 from apps.clinical_capture.worker import _close_recording, _open_recording, _reconnect_capture, normalize_frame
@@ -78,6 +86,80 @@ class ClinicalModelTests(unittest.TestCase):
         )
         self.assertIn("左、下", message)
         self.assertIn("微调", message)
+
+    def test_recording_gate_explains_each_missing_requirement(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": False,
+            "device_settings": {"confirmed": True},
+            "preflight": {
+                "ready": False,
+                "blocking_reasons": [
+                    "right_eye: 帧率 80.0 低于 156.0",
+                    "left_eye: 请将左眼整只瞳孔移入画面",
+                ],
+                "pupil_alignment": {
+                    "required": True,
+                    "ready": False,
+                    "guidance": "请将左眼相机向左微调",
+                },
+            },
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "",
+                "visit_id": "V1",
+                "operator": "",
+                "consent_confirmed": False,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertEqual(result["label"], "暂不可录制")
+        self.assertIn("right_eye: 帧率 80.0 低于 156.0", result["reasons"])
+        self.assertIn("left_eye: 请将左眼整只瞳孔移入画面", result["reasons"])
+        self.assertTrue(any("会话信息未完成" in reason for reason in result["reasons"]))
+        self.assertEqual(recording_reason_label("right_eye: 帧率过低"), "右眼：帧率过低")
+
+    def test_recording_gate_reports_ready_only_when_all_conditions_pass(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": True,
+            "device_settings": {"confirmed": True},
+            "preflight": {
+                "ready": True,
+                "blocking_reasons": [],
+                "pupil_alignment": {"required": False, "ready": True},
+            },
+        }
+        fields = {
+            "subject_code": "P-001",
+            "visit_id": "V1",
+            "operator": "Dr",
+            "consent_confirmed": True,
+        }
+        result = recording_gate_status(status, session_fields=fields)
+        self.assertTrue(result["can_record"])
+        self.assertEqual(result["label"], "可以录制")
+        self.assertEqual(recording_gate_reasons(status, session_fields=fields), [])
+
+    def test_recording_gate_never_reports_ready_while_session_is_active(self) -> None:
+        status = {
+            "app_state": "recording",
+            "simulate": True,
+            "preflight": {"ready": True},
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertIn("当前会话正在录制或保存", result["reasons"])
 
     def test_pupil_alignment_requires_a_continuous_confident_hold(self) -> None:
         class Detector:

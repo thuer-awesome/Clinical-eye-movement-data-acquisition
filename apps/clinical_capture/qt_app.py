@@ -128,6 +128,143 @@ def camera_state_label(value: Any) -> str:
     }.get(str(value), str(value or "未知"))
 
 
+def recording_gate_status(
+    status_payload: Mapping[str, Any] | None,
+    *,
+    fields_ready: bool | None = None,
+    session_fields: Mapping[str, Any] | None = None,
+    busy: bool = False,
+) -> dict[str, Any]:
+    """Explain whether the operator may start a recording.
+
+    This is deliberately a display-side projection of the existing start
+    conditions.  The manager remains the authoritative gate; this helper only
+    turns its status payload into a stable label and actionable reasons for the
+    operator.  Keeping it free of Qt types also makes the decision testable on
+    headless CI runners.
+    """
+    status = status_payload if isinstance(status_payload, Mapping) else {}
+    reasons: list[str] = []
+    app_state = str(status.get("app_state") or "starting")
+    simulate = bool(status.get("simulate"))
+
+    if busy:
+        reasons.append("正在处理上一项操作，请稍候")
+
+    if app_state in {"recording", "stopping"}:
+        reasons.append("当前会话正在录制或保存，请先停止当前会话")
+    else:
+        if app_state != "ready":
+            reasons.append(f"采集设备状态为“{state_label(app_state)}”，尚未就绪")
+
+        preflight = status.get("preflight")
+        if not isinstance(preflight, Mapping):
+            reasons.append("尚未收到设备预检结果")
+        elif not bool(preflight.get("ready")):
+            raw_reasons = preflight.get("blocking_reasons")
+            added_preflight_reason = False
+            if isinstance(raw_reasons, (list, tuple)):
+                for reason in raw_reasons:
+                    normalized = str(reason).strip()
+                    if normalized:
+                        reasons.append(normalized)
+                        added_preflight_reason = True
+            if not added_preflight_reason:
+                reasons.append("设备预检尚未通过")
+
+        settings = status.get("device_settings")
+        if (
+            not simulate
+            and isinstance(settings, Mapping)
+            and not bool(settings.get("confirmed"))
+            and not any("映射" in reason or "画面方向" in reason for reason in reasons)
+        ):
+            reasons.append("左右眼相机映射和画面方向尚未确认")
+
+        preflight = status.get("preflight")
+        alignment = preflight.get("pupil_alignment") if isinstance(preflight, Mapping) else None
+        raw_reasons = preflight.get("blocking_reasons") if isinstance(preflight, Mapping) else None
+        if (
+            isinstance(alignment, Mapping)
+            and alignment.get("required")
+            and not alignment.get("ready")
+            and not raw_reasons
+        ):
+            # Manager preflight normally includes one reason per eye.  Add a
+            # concise aggregate only when that detail is unavailable.
+            if not any("瞳孔" in reason or "对准" in reason for reason in reasons):
+                guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
+                reasons.append(f"双眼瞳孔对准未完成：{guidance}")
+
+    is_recording = app_state in {"recording", "stopping"}
+    if fields_ready is None:
+        if isinstance(session_fields, Mapping):
+            fields_ready = bool(
+                str(session_fields.get("subject_code") or "").strip()
+                and str(session_fields.get("visit_id") or "").strip()
+                and str(session_fields.get("operator") or "").strip()
+                and bool(session_fields.get("consent_confirmed"))
+            )
+        else:
+            fields_ready = False
+    if not fields_ready and not is_recording:
+        if isinstance(session_fields, Mapping):
+            missing: list[str] = []
+            for key, label in (
+                ("subject_code", "受试者编号"),
+                ("visit_id", "访视编号"),
+                ("operator", "操作员"),
+            ):
+                if not str(session_fields.get(key) or "").strip():
+                    missing.append(label)
+            if not bool(session_fields.get("consent_confirmed")):
+                missing.append("知情同意确认")
+            reasons.append("会话信息未完成：" + "、".join(missing))
+        else:
+            reasons.append("会话信息未完成：填写受试者编号、访视编号、操作员并确认知情同意")
+
+    # Preserve the order (device, alignment, metadata) while avoiding repeated
+    # messages when a backend payload already contains an aggregate reason.
+    unique_reasons: list[str] = []
+    for reason in reasons:
+        if reason and reason not in unique_reasons:
+            unique_reasons.append(reason)
+    can_record = not unique_reasons
+    return {
+        "can_record": can_record,
+        "ready": can_record,
+        "label": "可以录制" if can_record else "暂不可录制",
+        "reasons": unique_reasons,
+        "blocking_reasons": unique_reasons,
+    }
+
+
+def recording_gate_reasons(
+    status_payload: Mapping[str, Any] | None,
+    *,
+    fields_ready: bool | None = None,
+    session_fields: Mapping[str, Any] | None = None,
+    busy: bool = False,
+) -> list[str]:
+    """Return only the actionable reasons from :func:`recording_gate_status`."""
+    return recording_gate_status(
+        status_payload,
+        fields_ready=fields_ready,
+        session_fields=session_fields,
+        busy=busy,
+    )["reasons"]
+
+
+def recording_reason_label(reason: Any) -> str:
+    """Translate an internal gate reason into operator-facing wording."""
+    text = str(reason or "").strip()
+    for role in ("right_eye", "left_eye"):
+        prefix = f"{role}:"
+        if text.startswith(prefix):
+            return f"{camera_label(role)}：{text[len(prefix):].lstrip()}"
+    return text
+
+
 def _binding_issues(status_payload: Mapping[str, Any], *, stale_timeout_ms: float = 2500.0) -> list[str]:
     """Return hardware binding issues after a settings restart."""
     preflight = status_payload.get("preflight")
@@ -531,6 +668,10 @@ if QT_AVAILABLE:
                 QLabel#subtitle { color: #91aaa5; }
                 QLabel#banner { border-left: 4px solid #ffca6b; padding: 9px 12px; color: #f5d6a0; background: #17282d; font-size: 14px; }
                 QLabel#banner[ready="true"] { border-left-color: #78d1c0; color: #bdeee2; background: #153231; }
+                QLabel#recordingGate { border: 1px solid #c86d6c; padding: 8px 10px; color: #ffd7d4; background: #3a2429; font-size: 17px; font-weight: 700; }
+                QLabel#recordingGate[ready="true"] { border-color: #5bbda9; color: #c9f5e9; background: #153b35; }
+                QLabel#recordingReasons { padding: 6px 8px; color: #f5d6a0; background: #13272d; }
+                QLabel#recordingReasons[ready="true"] { color: #bdeee2; background: #153231; }
                 QLabel#cameraState[state="ready"], QLabel#cameraState[state="recording"] { color: #78d1c0; }
                 QLabel#cameraState[state="reconnecting"], QLabel#cameraState[state="starting"] { color: #ffca6b; }
                 QLabel#cameraState[state="error"] { color: #ef8c87; }
@@ -625,10 +766,21 @@ if QT_AVAILABLE:
             form.addRow("筛查标签", self.screening_combo)
             form.addRow("备注", self.notes_edit)
             form.addRow("", self.consent_check)
+            for edit in (self.subject_edit, self.visit_edit, self.operator_edit):
+                edit.textChanged.connect(self._update_controls)
+            self.consent_check.toggled.connect(self._update_controls)
             layout.addWidget(session_group)
 
             actions = QGroupBox("采集控制")
             actions_layout = QVBoxLayout(actions)
+            self.recording_gate_label = QLabel("暂不可录制")
+            self.recording_gate_label.setObjectName("recordingGate")
+            self.recording_gate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.recording_reasons_label = QLabel("正在检查设备、瞳孔检测和会话信息…")
+            self.recording_reasons_label.setObjectName("recordingReasons")
+            self.recording_reasons_label.setWordWrap(True)
+            actions_layout.addWidget(self.recording_gate_label)
+            actions_layout.addWidget(self.recording_reasons_label)
             self.start_button = QPushButton("开始录制")
             self.start_button.setObjectName("startButton")
             self.start_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
@@ -821,19 +973,21 @@ if QT_AVAILABLE:
                 if isinstance(item, Mapping):
                     card.update_status(item, simulate)
 
+            gate = recording_gate_status(
+                status,
+                session_fields=self._session_fields(),
+                busy=self._busy,
+            )
             alignment = preflight.get("pupil_alignment") if isinstance(preflight.get("pupil_alignment"), Mapping) else {}
             if app_state in {"recording", "stopping"}:
                 message = "正在采集：原始 AVI 和时间戳直接写盘；如短暂掉线，等待页面显示重连结果。"
-            elif not confirmed:
-                message = "请先确认左右眼物理索引和画面方向。旋转会在 worker 首帧验证后显示为已验证。"
-            elif alignment.get("required") and not alignment.get("ready"):
-                message = str(alignment.get("guidance") or "请根据左右眼预览中的箭头微调相机，等待置信度稳定达标。")
-            elif preflight.get("ready"):
-                message = "双眼设备、帧率和瞳孔门禁均已通过，可以填写会话信息并开始录制。"
+            elif gate["can_record"]:
+                message = "设备预检、双眼瞳孔门禁和会话信息均已通过，可以开始录制。"
             else:
-                message = str(preflight.get("blocking_reasons", ["等待设备预检"])[0] if preflight.get("blocking_reasons") else "等待设备预检")
+                first_reason = recording_reason_label(gate["reasons"][0]) if gate["reasons"] else "等待设备预检"
+                message = f"暂不可录制：{first_reason}"
             self.banner.setText(message)
-            self.banner.setProperty("ready", bool(preflight.get("ready")))
+            self.banner.setProperty("ready", bool(gate["can_record"]))
             self.banner.style().unpolish(self.banner)
             self.banner.style().polish(self.banner)
 
@@ -858,24 +1012,48 @@ if QT_AVAILABLE:
                 if pupil_rates:
                     quality_bits.append("；".join(pupil_rates))
             self.quality_summary.setText(" · ".join(quality_bits))
+            self._render_recording_gate(gate)
             self._refresh_review_table()
             self._update_controls()
 
-        def _update_controls(self) -> None:
+        def _session_fields(self) -> dict[str, Any]:
+            """Return the operator-entered fields used by the display gate."""
+            return {
+                "subject_code": self.subject_edit.text().strip(),
+                "visit_id": self.visit_edit.text().strip(),
+                "operator": self.operator_edit.text().strip(),
+                "consent_confirmed": self.consent_check.isChecked(),
+            }
+
+        def _render_recording_gate(self, gate: Mapping[str, Any]) -> None:
+            """Render one unambiguous status and its actionable blockers."""
+            can_record = bool(gate.get("can_record"))
+            self.recording_gate_label.setText(str(gate.get("label") or "暂不可录制"))
+            self.recording_gate_label.setProperty("ready", can_record)
+            self.recording_gate_label.style().unpolish(self.recording_gate_label)
+            self.recording_gate_label.style().polish(self.recording_gate_label)
+            reasons = [recording_reason_label(reason) for reason in gate.get("reasons", []) if str(reason).strip()]
+            if can_record:
+                text = "设备预检、双眼瞳孔门禁和会话信息均已通过。"
+            else:
+                text = "阻塞原因：\n" + "\n".join(f"- {reason}" for reason in reasons)
+            self.recording_reasons_label.setText(text)
+            self.recording_reasons_label.setProperty("ready", can_record)
+            self.recording_reasons_label.style().unpolish(self.recording_reasons_label)
+            self.recording_reasons_label.style().polish(self.recording_reasons_label)
+
+        def _update_controls(self, *_args: Any) -> None:
             status = self._status or {}
             app_state = str(status.get("app_state") or "starting")
             recording = app_state in {"recording", "stopping"}
-            preflight = status.get("preflight") if isinstance(status.get("preflight"), Mapping) else {}
-            alignment = preflight.get("pupil_alignment") if isinstance(preflight.get("pupil_alignment"), Mapping) else {}
-            fields_ready = bool(self.subject_edit.text().strip() and self.visit_edit.text().strip() and self.operator_edit.text().strip() and self.consent_check.isChecked())
-            can_start = (
-                not self._busy
-                and not recording
-                and app_state == "ready"
-                and bool(preflight.get("ready"))
-                and (not alignment.get("required") or bool(alignment.get("ready")))
-                and fields_ready
-            )
+            gate = recording_gate_status(status, session_fields=self._session_fields(), busy=self._busy)
+            self._render_recording_gate(gate)
+            can_start = bool(gate.get("can_record"))
+            if can_start:
+                self.start_button.setToolTip("设备、瞳孔门禁和会话信息均已通过，可以开始录制")
+            else:
+                reasons = "；".join(recording_reason_label(reason) for reason in gate.get("reasons", []))
+                self.start_button.setToolTip(f"暂不可录制：{reasons}")
             self.start_button.setEnabled(can_start)
             self.stop_button.setEnabled(not self._busy and recording)
             self.preflight_button.setEnabled(not self._busy and not recording)
