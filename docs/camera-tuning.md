@@ -68,4 +68,4 @@
 
 ## 旋转是否生效
 
-`frame_transform` 是采集 worker 内的像素变换，先于共享内存、瞳孔检测和 AVI 写入执行；它不修改 DirectShow/UVC 的传输参数，因此不会导致相机掉线。首次真实帧进入流水线后，状态会将 `transform_verified=true`，页面卡片显示“方向已应用”；会话 `quality.json` 和 `config.json` 同时保存方向值。验证时应以实时预览和导出的 `*_annotated.avi`/`*_pupil_preview.jpg` 为准，原始 AVI 保持同样的已配置方向但不叠加标记。
+`frame_transform` 是采集 worker 内的像素变换，先于共享内存、瞳孔检测和 AVI 写入执行；它不修改 DirectShow/UVC 的传输参数，因此不会导致相机掉线。首次真实帧进入流水线后，状态会将 `transform_verified=true`，页面卡片显示“方向已验证”；在首帧验证前，真实模式的“开始录制”保持禁用。会话 `quality.json` 和 `config.json` 同时保存方向值。验证时应以实时预览和导出的 `*_annotated.avi`/`*_pupil_preview.jpg` 为准，原始 AVI 保持同样的已配置方向但不叠加标记。

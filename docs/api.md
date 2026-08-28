@@ -25,7 +25,7 @@
 
 `GET /api/status` 的 `preflight.pupil_alignment` 表示录制前总门禁：`required`、`ready`、`progress`、`hold_seconds`、`confidence_threshold` 和当前 `guidance`。每只眼的 `preflight.cameras.<eye>.pupil.alignment` 还包含状态（`searching`、`adjust`、`holding`、`ready` 或 `error`）、置信度、中心是否合格、检测帧新鲜度和方向提示。真实模式下，只要任一必需眼位未对准，`preflight.ready=false`，`POST /api/session/start` 会返回 `409`，不能通过 API 绕过。模拟模式会明确标记对准门禁为跳过。
 
-相机状态还会返回 `frame_transform`、`transform_applied` 和 `transform_verified`。后者在首帧经过 worker 的方向处理并进入共享内存后变为 `true`，可用来确认旋转/镜像设置确实生效。发生短暂 USB 空帧时，状态会短暂显示 `reconnecting`，并更新 `reconnect_count`；恢复成功后继续原会话写盘。`last_frame_age_ms` 只由真实帧刷新，不能用重连提示判断帧流仍然健康。
+相机状态还会返回 `frame_transform`、`transform_applied` 和 `transform_verified`。后者在首帧经过 worker 的方向处理并进入共享内存后变为 `true`，可用来确认旋转/镜像设置确实生效；真实模式下首帧验证前不会通过录制门禁。`stats.frames_in_interval`、递增的 `sequence` 和 `timestamp_ns` 共同证明统计周期确有新帧，零帧或重复统计不会刷新看门狗，`capture_fps=0` 会阻塞录制。发生短暂 USB 空帧时，状态会短暂显示 `reconnecting`，并更新 `reconnect_count`；恢复成功后继续原会话写盘。`last_frame_age_ms` 只由真实帧刷新，不能用重连提示判断帧流仍然健康。
 
 ## 开始会话示例
 
