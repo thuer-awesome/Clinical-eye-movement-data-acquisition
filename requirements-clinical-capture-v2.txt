@@ -1,0 +1,4 @@
+# Native PySide6 workstation dependencies for the version 2 branch.
+# The browser/service dependencies remain available for compatibility.
+-r requirements-clinical-capture.txt
+PySide6>=6.7,<7

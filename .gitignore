@@ -41,6 +41,11 @@ data/logs/
 # Clinical Capture build output and local session data.
 build/
 dist/
+build-debug/
+dist-debug/
+build-qt-smoke/
+dist-qt-smoke/
+QtSmoke.spec
 data/clinical_sessions/
 .codex-temp/clinical_*/
 ClinicalCapture-portable-fixed/

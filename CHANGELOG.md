@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 - PySide6 version 2 workstation
+
+- Added a native PySide6 operator window with simultaneous right/left eye previews.
+- Added a centered eye-orbit framing guide, structured adjustment arrows, confidence/hold progress, and recording controls backed by the existing manager.
+- Colored the framing guide from red to yellow to green using the current detector confidence; stale/disconnected frames are shown in gray.
+- Kept the guide visual-only: Detector2D geometry, confidence threshold, freshness, and continuous hold remain the recording gate.
+- Added standalone V2 dependency, PyInstaller, portable-package, and Inno Setup entry points.
+- Hardened the PyInstaller spec against incompatible third-party ICU DLLs that can prevent QtCore from loading on Windows.
+
+## 0.6.0 - 2026-08-28
+
+- 相机 worker 对连续空帧执行有界重连，短暂 USB/DirectShow 抖动不再立即终止当前会话；重连耗尽仍安全结束并保留已写文件。
+- 帧流看门狗改为只依据真实 `stats` 帧更新时间，避免重连状态消息掩盖实际超时。
+- 实时状态、`quality.json`、`pupil_report.json` 和临床报告记录方向是否已应用、方向是否已验证、重连次数及尝试次数。
+- 页面显示“正在重连”和“方向已应用”，并在相机卡片和报告中提供可审计的运行证据。
+
 ## 0.5.0 - 2026-08-28
 
 - 增加真实相机录制前的双眼瞳孔对准门禁：按瞳孔中心偏移给出上下左右微调方向，置信度和中心位置连续达标后才允许开始录制。
