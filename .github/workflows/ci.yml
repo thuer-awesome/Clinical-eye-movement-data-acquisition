@@ -48,3 +48,34 @@ jobs:
           name: ClinicalCapture-portable
           path: dist/ClinicalCapture-portable.zip
           if-no-files-found: error
+
+  windows-portable-v2:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-clinical-capture-v2.txt
+      - name: Install V2 build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m venv .venv-v2
+          & .\.venv-v2\Scripts\python.exe -m pip install --upgrade pip
+          & .\.venv-v2\Scripts\python.exe -m pip install -r requirements-clinical-capture-v2.txt
+      - name: Compile and smoke-test V2 module
+        shell: pwsh
+        run: |
+          & .\.venv-v2\Scripts\python.exe -m compileall -q apps
+          & .\.venv-v2\Scripts\python.exe -c "from apps.clinical_capture.qt_app import QT_AVAILABLE; assert QT_AVAILABLE"
+      - name: Build V2 portable workstation
+        shell: pwsh
+        run: .\scripts\build_clinical_capture_v2.ps1 -SkipInstall -PythonPath (Resolve-Path .\.venv-v2\Scripts\python.exe)
+      - name: Upload V2 portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClinicalCaptureV2-portable
+          path: dist/ClinicalCaptureV2-portable.zip
+          if-no-files-found: error
