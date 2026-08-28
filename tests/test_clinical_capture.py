@@ -159,7 +159,34 @@ class ClinicalModelTests(unittest.TestCase):
             },
         )
         self.assertFalse(result["can_record"])
-        self.assertIn("当前会话正在录制或保存", result["reasons"])
+        self.assertTrue(any("当前会话正在录制或保存" in reason for reason in result["reasons"]))
+
+    def test_recording_gate_keeps_unspecified_mapping_and_alignment_visible(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": False,
+            "preflight": {
+                "ready": False,
+                "blocking_reasons": ["右眼：帧率不足"],
+                "pupil_alignment": {
+                    "required": True,
+                    "ready": False,
+                    "guidance": "请将左眼相机向左微调",
+                },
+            },
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertIn("左右眼相机映射和画面方向尚未确认", result["reasons"])
+        self.assertTrue(any("双眼瞳孔对准未完成" in reason for reason in result["reasons"]))
 
     def test_pupil_alignment_requires_a_continuous_confident_hold(self) -> None:
         class Detector:

@@ -173,28 +173,26 @@ def recording_gate_status(
                 reasons.append("设备预检尚未通过")
 
         settings = status.get("device_settings")
+        settings_confirmed = isinstance(settings, Mapping) and bool(settings.get("confirmed"))
         if (
             not simulate
-            and isinstance(settings, Mapping)
-            and not bool(settings.get("confirmed"))
+            and not settings_confirmed
             and not any("映射" in reason or "画面方向" in reason for reason in reasons)
         ):
             reasons.append("左右眼相机映射和画面方向尚未确认")
 
         preflight = status.get("preflight")
         alignment = preflight.get("pupil_alignment") if isinstance(preflight, Mapping) else None
-        raw_reasons = preflight.get("blocking_reasons") if isinstance(preflight, Mapping) else None
         if (
             isinstance(alignment, Mapping)
             and alignment.get("required")
             and not alignment.get("ready")
-            and not raw_reasons
+            and not any("瞳孔" in reason or "对准" in reason for reason in reasons)
         ):
             # Manager preflight normally includes one reason per eye.  Add a
             # concise aggregate only when that detail is unavailable.
-            if not any("瞳孔" in reason or "对准" in reason for reason in reasons):
-                guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
-                reasons.append(f"双眼瞳孔对准未完成：{guidance}")
+            guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
+            reasons.append(f"双眼瞳孔对准未完成：{guidance}")
 
     is_recording = app_state in {"recording", "stopping"}
     if fields_ready is None:
@@ -219,7 +217,11 @@ def recording_gate_status(
                     missing.append(label)
             if not bool(session_fields.get("consent_confirmed")):
                 missing.append("知情同意确认")
-            reasons.append("会话信息未完成：" + "、".join(missing))
+            reasons.append(
+                "会话信息未完成：" + "、".join(missing)
+                if missing
+                else "会话信息未完成：请检查必填字段和知情同意确认"
+            )
         else:
             reasons.append("会话信息未完成：填写受试者编号、访视编号、操作员并确认知情同意")
 
@@ -1034,7 +1036,11 @@ if QT_AVAILABLE:
             self.recording_gate_label.style().polish(self.recording_gate_label)
             reasons = [recording_reason_label(reason) for reason in gate.get("reasons", []) if str(reason).strip()]
             if can_record:
-                text = "设备预检、双眼瞳孔门禁和会话信息均已通过。"
+                text = (
+                    "设备预检和会话信息均已通过（模拟模式跳过真实瞳孔门禁）。"
+                    if bool(self._status and self._status.get("simulate"))
+                    else "设备预检、双眼瞳孔门禁和会话信息均已通过。"
+                )
             else:
                 text = "阻塞原因：\n" + "\n".join(f"- {reason}" for reason in reasons)
             self.recording_reasons_label.setText(text)
