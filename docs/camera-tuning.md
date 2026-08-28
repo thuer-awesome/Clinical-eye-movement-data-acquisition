@@ -51,5 +51,21 @@
 | 单路正常、双路低 FPS | USB 控制器/HUB/线材带宽 | 分配不同 USB 控制器，保持 MJPG 和 320×240 |
 | 实际 FPS 低于 156 | 驱动协商、曝光、后台占用或线材 | 查看 `actual`、`read_p95_ms`，点击重新检查；仍失败不要开始会话 |
 | 打开后约 1 fps | 设备句柄未释放或 FOURCC 回退 | 等待自动恢复；必要时关闭占用程序后重启服务 |
+| 采集中短暂掉线后自动恢复 | USB/DirectShow 瞬时空帧 | worker 会在连续空帧后释放旧句柄并按 `camera_reconnect_attempts` 有界重连；页面显示“正在重连”和累计次数，恢复后继续写入同一会话 |
+| 重连耗尽 | USB、线材、供电或驱动持续故障 | 会话安全结束并保留已写入 AVI、帧时间戳和质量报告；先更换独立 USB 控制器/线材，再重新预检 |
 | 画面倒置/左右错 | 物理安装和逻辑映射混淆 | 用缩略图重新设索引和方向，不能只翻浏览器显示 |
 | 预览卡顿但 AVI 正常 | 浏览器刷新频率或 JPEG 编码 | 先以 `quality.json` 和帧 CSV 为准 |
+
+## 断线恢复参数
+
+`clinical-capture.json` 默认使用连续 3 次空帧后重连，最多尝试 3 次，每次等待 `0.2 s`：
+
+- `camera_read_failure_threshold`：触发重连前允许的连续 `read()` 空帧数；避免一次瞬时 USB 抖动就重开设备。
+- `camera_reconnect_attempts`：一次恢复周期最多重新打开设备的次数；达到上限才报告进程错误。
+- `camera_reconnect_delay_seconds`：释放句柄后等待下一次打开的间隔，给 DirectShow 和 USB 控制器时间完成复位。
+
+重连期间不会伪造帧，也不会把状态消息当作“新帧”；帧流看门狗只依据真实 `stats` 帧更新时间。恢复成功时，原始 AVI 继续写入，时间戳 CSV 会保留掉线造成的间隔，质量报告中的 `reconnect_count` 和 `reconnect_attempts_total` 可用于复核。
+
+## 旋转是否生效
+
+`frame_transform` 是采集 worker 内的像素变换，先于共享内存、瞳孔检测和 AVI 写入执行；它不修改 DirectShow/UVC 的传输参数，因此不会导致相机掉线。首次真实帧进入流水线后，状态会将 `transform_verified=true`，页面卡片显示“方向已应用”；会话 `quality.json` 和 `config.json` 同时保存方向值。验证时应以实时预览和导出的 `*_annotated.avi`/`*_pupil_preview.jpg` 为准，原始 AVI 保持同样的已配置方向但不叠加标记。
