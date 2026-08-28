@@ -128,12 +128,31 @@ def camera_state_label(value: Any) -> str:
     }.get(str(value), str(value or "未知"))
 
 
+def session_validation_label(error: Any) -> str:
+    """Translate ``SessionMetadata`` validation errors for operators."""
+    detail = str(error).strip() or "会话信息格式不正确"
+    translations = {
+        "subject_code must use 1-64 letters, numbers, '.', '_' or '-'": (
+            "受试者编号格式不正确，仅允许 1-64 位字母、数字、点、下划线或短横线"
+        ),
+        "visit_id must use 1-64 letters, numbers, '.', '_' or '-'": (
+            "访视编号格式不正确，仅允许 1-64 位字母、数字、点、下划线或短横线"
+        ),
+        "operator must contain 1-120 printable characters": "操作员应填写 1-120 个可打印字符",
+        "protocol contains unsupported control characters": "采集方案包含不支持的控制字符",
+        "notes must be at most 4000 characters": "备注不得超过 4000 个字符，且不能包含不支持的控制字符",
+        "consent_confirmed must be true before recording": "请确认知情同意与院内数据授权",
+    }
+    return translations.get(detail, detail)
+
+
 def recording_gate_status(
     status_payload: Mapping[str, Any] | None,
     *,
     fields_ready: bool | None = None,
     session_fields: Mapping[str, Any] | None = None,
     busy: bool = False,
+    device_settings_dirty: bool = False,
 ) -> dict[str, Any]:
     """Explain whether the operator may start a recording.
 
@@ -163,7 +182,7 @@ def recording_gate_status(
         preflight = status.get("preflight")
         if not isinstance(preflight, Mapping):
             reasons.append("尚未收到设备预检结果")
-        elif not bool(preflight.get("ready")):
+        else:
             raw_reasons = preflight.get("blocking_reasons")
             added_preflight_reason = False
             if isinstance(raw_reasons, (list, tuple)):
@@ -172,8 +191,25 @@ def recording_gate_status(
                     if normalized:
                         reasons.append(normalized)
                         added_preflight_reason = True
-            if not added_preflight_reason:
+            if not bool(preflight.get("ready")) and not added_preflight_reason:
                 reasons.append("设备预检尚未通过")
+
+            cameras = preflight.get("cameras")
+            if not simulate and bool(preflight.get("ready")):
+                if not isinstance(cameras, Mapping):
+                    reasons.append("设备预检结果不完整，尚未收到双眼相机状态")
+                else:
+                    for role in ("right_eye", "left_eye"):
+                        item = cameras.get(role)
+                        if not isinstance(item, Mapping):
+                            reasons.append(f"{role}: 尚未收到相机状态")
+                            continue
+                        if item.get("state") not in {"ready", "recording"}:
+                            reasons.append(f"{role}: 相机尚未就绪")
+                        if float(item.get("capture_fps") or 0.0) <= 0.0:
+                            reasons.append(f"{role}: 尚未收到有效帧率")
+                        if not bool(item.get("transform_verified")):
+                            reasons.append(f"{role}: 画面方向尚未通过首帧验证")
 
         settings = status.get("device_settings")
         settings_confirmed = isinstance(settings, Mapping) and bool(settings.get("confirmed"))
@@ -184,30 +220,34 @@ def recording_gate_status(
             and not any("映射" in reason or "画面方向" in reason for reason in reasons)
         ):
             reasons.append("左右眼相机映射和画面方向尚未确认")
+        if device_settings_dirty:
+            reasons.append("相机映射或画面方向已修改但尚未保存，请点击“保存并重启相机”")
 
         preflight = status.get("preflight")
         alignment = preflight.get("pupil_alignment") if isinstance(preflight, Mapping) else None
-        if (
-            not status_error
-            and isinstance(alignment, Mapping)
-            and alignment.get("required")
-            and not alignment.get("ready")
-            and not any("瞳孔" in reason or "对准" in reason for reason in reasons)
-        ):
-            # Manager preflight normally includes one reason per eye.  Add a
-            # concise aggregate only when that detail is unavailable.
-            guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
-            reasons.append(f"双眼瞳孔对准未完成：{guidance}")
+        if not status_error and not simulate:
+            if not isinstance(alignment, Mapping):
+                reasons.append("尚未收到双眼瞳孔对准结果")
+            elif not bool(alignment.get("required")):
+                reasons.append("现场模式的真实瞳孔录制门禁尚未启用")
+            elif not bool(alignment.get("ready")) and not any(
+                "瞳孔" in reason or "对准" in reason for reason in reasons
+            ):
+                # Manager preflight normally includes one reason per eye.  Add
+                # a concise aggregate only when that detail is unavailable.
+                guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
+                reasons.append(f"双眼瞳孔对准未完成：{guidance}")
 
     is_recording = app_state in {"recording", "stopping"}
+    validation_error: str | None = None
     if fields_ready is None:
         if isinstance(session_fields, Mapping):
-            fields_ready = bool(
-                str(session_fields.get("subject_code") or "").strip()
-                and str(session_fields.get("visit_id") or "").strip()
-                and str(session_fields.get("operator") or "").strip()
-                and bool(session_fields.get("consent_confirmed"))
-            )
+            try:
+                SessionMetadata.from_mapping(session_fields)
+                fields_ready = True
+            except ValueError as error:
+                fields_ready = False
+                validation_error = session_validation_label(error)
         else:
             fields_ready = False
     if not fields_ready and not is_recording:
@@ -222,11 +262,12 @@ def recording_gate_status(
                     missing.append(label)
             if not bool(session_fields.get("consent_confirmed")):
                 missing.append("知情同意确认")
-            reasons.append(
-                "会话信息未完成：" + "、".join(missing)
-                if missing
-                else "会话信息未完成：请检查必填字段和知情同意确认"
-            )
+            if missing:
+                reasons.append("会话信息未完成：" + "、".join(missing))
+            elif validation_error:
+                reasons.append("会话信息不符合要求：" + validation_error)
+            else:
+                reasons.append("会话信息未完成：请检查必填字段和知情同意确认")
         else:
             reasons.append("会话信息未完成：填写受试者编号、访视编号、操作员并确认知情同意")
 
@@ -252,6 +293,7 @@ def recording_gate_reasons(
     fields_ready: bool | None = None,
     session_fields: Mapping[str, Any] | None = None,
     busy: bool = False,
+    device_settings_dirty: bool = False,
 ) -> list[str]:
     """Return only the actionable reasons from :func:`recording_gate_status`."""
     return recording_gate_status(
@@ -259,6 +301,7 @@ def recording_gate_reasons(
         fields_ready=fields_ready,
         session_fields=session_fields,
         busy=busy,
+        device_settings_dirty=device_settings_dirty,
     )["reasons"]
 
 
@@ -389,6 +432,8 @@ def _binding_issues(status_payload: Mapping[str, Any], *, stale_timeout_ms: floa
         age_ms = item.get("last_frame_age_ms")
         if isinstance(age_ms, (int, float)) and float(age_ms) > max(0.0, float(stale_timeout_ms)):
             issues.append(f"{camera_label(role)}：帧流超时")
+        if not bool(status_payload.get("simulate")) and not bool(item.get("transform_verified")):
+            issues.append(f"{camera_label(role)}：画面方向尚未通过首帧验证")
     return issues
 
 
@@ -489,6 +534,9 @@ if QT_AVAILABLE:
             self._image: QImage | None = None
             self._alignment: dict[str, Any] = {}
             self._pupil: dict[str, Any] = {}
+            self._stream_state = "offline"
+            self._stream_error = ""
+            self._stream_stale = False
             self.setMinimumSize(360, 270)
             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self.setToolTip("眼眶正对范围仅用于帮助调整镜头；录制门禁仍只使用真实瞳孔检测置信度和几何。")
@@ -523,6 +571,13 @@ if QT_AVAILABLE:
         def set_status(self, pupil: Mapping[str, Any] | None, alignment: Mapping[str, Any] | None) -> None:
             self._pupil = dict(pupil or {})
             self._alignment = dict(alignment or {})
+            self.update()
+
+        def set_stream_state(self, state: Any, *, error: Any = None, stale: bool = False) -> None:
+            """Expose camera freshness so an old frame is never mistaken for live."""
+            self._stream_state = str(state or "offline")
+            self._stream_error = str(error or "").strip()
+            self._stream_stale = bool(stale)
             self.update()
 
         def _image_rect(self) -> QRectF:
@@ -585,6 +640,13 @@ if QT_AVAILABLE:
                 )
                 painter.drawPixmap(actual, scaled, QRectF(scaled.rect()))
                 image_rect = actual
+                if self._stream_state not in {"ready", "recording"} or self._stream_stale:
+                    painter.fillRect(image_rect, QColor(0, 0, 0, 155))
+                    painter.setPen(QColor("#ffd7d4"))
+                    message = self._stream_error or (
+                        "画面已过期，请等待相机重连" if self._stream_stale else "画面不可用"
+                    )
+                    painter.drawText(image_rect, Qt.AlignmentFlag.AlignCenter, message)
 
             left_n, top_n, right_n, bottom_n = self._guide_rect
             guide = QRectF(
@@ -711,6 +773,15 @@ if QT_AVAILABLE:
             progress = max(0.0, min(1.0, float(alignment.get("progress") or 0.0)))
             self.progress.setValue(round(progress * 100))
             self.preview.set_status(pupil, alignment)
+            try:
+                age_ms = float(camera.get("last_frame_age_ms"))
+            except (TypeError, ValueError):
+                age_ms = float("inf")
+            self.preview.set_stream_state(
+                state,
+                error=camera.get("error"),
+                stale=age_ms > 2500.0 or fps <= 0.0,
+            )
 
 
     class ClinicalCaptureWindow(QMainWindow):
@@ -872,8 +943,17 @@ if QT_AVAILABLE:
             form.addRow("筛查标签", self.screening_combo)
             form.addRow("备注", self.notes_edit)
             form.addRow("", self.consent_check)
-            for edit in (self.subject_edit, self.visit_edit, self.operator_edit):
+            for edit in (
+                self.subject_edit,
+                self.visit_edit,
+                self.operator_edit,
+                self.protocol_edit,
+                self.notes_edit,
+            ):
                 edit.textChanged.connect(self._update_controls)
+            self.age_spin.valueChanged.connect(self._update_controls)
+            self.sex_combo.currentIndexChanged.connect(self._update_controls)
+            self.screening_combo.currentIndexChanged.connect(self._update_controls)
             self.consent_check.toggled.connect(self._update_controls)
             layout.addWidget(session_group)
 
@@ -929,6 +1009,8 @@ if QT_AVAILABLE:
                 if camera:
                     transform.setCurrentText(camera.frame_transform)
                 self.device_controls[name] = (index, transform)
+                index.valueChanged.connect(self._update_controls)
+                transform.currentTextChanged.connect(self._update_controls)
                 device_layout.addWidget(role_label, row, 0)
                 device_layout.addWidget(index, row, 1)
                 device_layout.addWidget(transform, row, 2)
@@ -1085,23 +1167,56 @@ if QT_AVAILABLE:
             )
             settings = status.get("device_settings") if isinstance(status.get("device_settings"), Mapping) else {}
             confirmed = bool(settings.get("confirmed")) or simulate
-            self.device_status_label.setText(
-                "本机映射已确认" if confirmed else "本机映射尚未确认：请扫描、选择左右眼和画面方向后保存"
-            )
+            settings_dirty = self._device_settings_are_dirty()
+            if settings_dirty:
+                self.device_status_label.setText("有未保存的相机映射或画面方向修改：保存并重启相机后才会生效")
+            else:
+                self.device_status_label.setText(
+                    "本机映射已确认" if confirmed else "本机映射尚未确认：请扫描、选择左右眼和画面方向后保存"
+                )
 
             cameras = preflight.get("cameras") if isinstance(preflight.get("cameras"), Mapping) else {}
             for name, card in self.eye_cards.items():
                 item = cameras.get(name)
                 if isinstance(item, Mapping):
                     card.update_status(item, simulate)
+                else:
+                    card.update_status(
+                        {
+                            "name": name,
+                            "state": "error",
+                            "error": "未收到相机状态",
+                            "capture_fps": 0.0,
+                            "last_frame_age_ms": None,
+                            "pupil": {
+                                "state": "error",
+                                "valid": False,
+                                "confidence": 0.0,
+                                "alignment": {
+                                    "state": "error",
+                                    "ready": False,
+                                    "fresh": False,
+                                    "confidence": 0.0,
+                                    "threshold": self.manager.config.pupil_confidence_threshold,
+                                    "guidance": "未收到相机状态",
+                                },
+                            },
+                        },
+                        simulate,
+                    )
 
             gate = recording_gate_status(
                 status,
                 session_fields=self._session_fields(),
                 busy=self._busy,
+                device_settings_dirty=self._device_settings_are_dirty(),
             )
             alignment = preflight.get("pupil_alignment") if isinstance(preflight.get("pupil_alignment"), Mapping) else {}
-            if app_state in {"recording", "stopping"}:
+            if status_error:
+                message = f"本地服务状态读取失败：{status_error}；开始录制已禁用"
+                if app_state in {"recording", "stopping"}:
+                    message += "，请先尝试停止并保存当前会话"
+            elif app_state in {"recording", "stopping"}:
                 message = "正在采集：原始 AVI 和时间戳直接写盘；如短暂掉线，等待页面显示重连结果。"
             elif gate["can_record"]:
                 message = "设备预检、双眼瞳孔门禁和会话信息均已通过，可以开始录制。"
@@ -1144,8 +1259,24 @@ if QT_AVAILABLE:
                 "subject_code": self.subject_edit.text().strip(),
                 "visit_id": self.visit_edit.text().strip(),
                 "operator": self.operator_edit.text().strip(),
+                "protocol": self.protocol_edit.text().strip(),
+                "age": self.age_spin.value() or None,
+                "sex": self.sex_combo.currentData(),
+                "screening": self.screening_combo.currentData(),
+                "notes": self.notes_edit.toPlainText(),
                 "consent_confirmed": self.consent_check.isChecked(),
             }
+
+        def _device_settings_are_dirty(self) -> bool:
+            """Return whether the visible mapping differs from the active config."""
+            configured = {camera.name: camera for camera in self.manager.config.cameras}
+            for name, (index, transform) in self.device_controls.items():
+                camera = configured.get(name)
+                if camera is None:
+                    return True
+                if int(index.value()) != int(camera.index) or str(transform.currentText()) != str(camera.frame_transform):
+                    return True
+            return False
 
         def _render_recording_gate(self, gate: Mapping[str, Any]) -> None:
             """Render one unambiguous status and its actionable blockers."""
@@ -1172,7 +1303,13 @@ if QT_AVAILABLE:
             status = self._status or {}
             app_state = str(status.get("app_state") or "starting")
             recording = app_state in {"recording", "stopping"}
-            gate = recording_gate_status(status, session_fields=self._session_fields(), busy=self._busy)
+            settings_dirty = self._device_settings_are_dirty()
+            gate = recording_gate_status(
+                status,
+                session_fields=self._session_fields(),
+                busy=self._busy,
+                device_settings_dirty=settings_dirty,
+            )
             self._render_recording_gate(gate)
             can_start = bool(gate.get("can_record"))
             if can_start:
@@ -1186,6 +1323,11 @@ if QT_AVAILABLE:
             self.export_button.setEnabled(not self._busy and bool(status.get("last_session")))
             self.scan_button.setEnabled(not self._busy and not recording)
             self.apply_device_button.setEnabled(not self._busy and not recording)
+            self.apply_device_button.setToolTip(
+                "有未保存的映射或方向修改，请保存并重启相机后再录制"
+                if settings_dirty
+                else "保存当前左右眼映射和画面方向，并重启相机使其生效"
+            )
             for index, transform in self.device_controls.values():
                 index.setEnabled(not self._busy and not recording)
                 transform.setEnabled(not self._busy and not recording)

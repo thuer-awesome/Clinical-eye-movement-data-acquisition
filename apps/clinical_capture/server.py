@@ -131,6 +131,8 @@ def create_app(
             age_ms = item.get("last_frame_age_ms")
             if isinstance(age_ms, (int, float)) and float(age_ms) > manager.config.stale_frame_timeout_seconds * 1000:
                 issues.append(f"{role}: 帧流超时")
+            if not manager.config.simulate and not bool(item.get("transform_verified")):
+                issues.append(f"{role}: 画面方向尚未通过首帧验证")
         return issues
 
     @app.get("/api/device-settings")

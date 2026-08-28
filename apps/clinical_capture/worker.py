@@ -238,6 +238,10 @@ def capture_worker(
                         "kind": "stats",
                         "camera": spec.name,
                         "sequence": frame_sequence,
+                        # This is explicit evidence that the status interval
+                        # contained fresh frames.  The manager must not treat a
+                        # repeated/zero-frame stats packet as a frame heartbeat.
+                        "frames_in_interval": interval_frames,
                         "capture_fps": interval_frames / elapsed,
                         "recorded_frames": recorded_frames,
                         "recording": recording,

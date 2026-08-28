@@ -235,6 +235,71 @@ class ClinicalModelTests(unittest.TestCase):
         self.assertIn("左右眼相机映射和画面方向尚未确认", result["reasons"])
         self.assertTrue(any("双眼瞳孔对准未完成" in reason for reason in result["reasons"]))
 
+    def test_recording_gate_rejects_invalid_session_identifiers_before_click(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": True,
+            "preflight": {"ready": True, "blocking_reasons": [], "pupil_alignment": {"required": False, "ready": True}},
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "../patient",
+                "visit_id": "V/1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertTrue(any("受试者编号格式不正确" in reason for reason in result["reasons"]))
+
+    def test_recording_gate_rejects_unverified_transform_and_inconsistent_preflight(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": False,
+            "device_settings": {"confirmed": True},
+            "preflight": {
+                "ready": True,
+                "blocking_reasons": ["设备状态刚刚变为未知"],
+                "pupil_alignment": {"required": True, "ready": True},
+                "cameras": {
+                    "right_eye": {"state": "ready", "capture_fps": 240.0, "transform_verified": False},
+                    "left_eye": {"state": "ready", "capture_fps": 240.0, "transform_verified": True},
+                },
+            },
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+        )
+        self.assertFalse(result["can_record"])
+        self.assertIn("设备状态刚刚变为未知", result["reasons"])
+        self.assertTrue(any("right_eye: 画面方向尚未通过首帧验证" in reason for reason in result["reasons"]))
+
+    def test_recording_gate_rejects_unsaved_camera_settings(self) -> None:
+        status = {
+            "app_state": "ready",
+            "simulate": True,
+            "preflight": {"ready": True, "blocking_reasons": [], "pupil_alignment": {"required": False, "ready": True}},
+        }
+        result = recording_gate_status(
+            status,
+            session_fields={
+                "subject_code": "P-001",
+                "visit_id": "V1",
+                "operator": "Dr",
+                "consent_confirmed": True,
+            },
+            device_settings_dirty=True,
+        )
+        self.assertFalse(result["can_record"])
+        self.assertTrue(any("尚未保存" in reason for reason in result["reasons"]))
+
     def test_pupil_alignment_requires_a_continuous_confident_hold(self) -> None:
         class Detector:
             def detect(self, _gray):
@@ -417,6 +482,44 @@ class ClinicalModelTests(unittest.TestCase):
                 self.assertEqual(manager._cameras["right_eye"]["last_frame_monotonic"], first)
             finally:
                 # Restore the multiprocessing queue contract used by close().
+                manager._status_queue = None
+                manager.close()
+
+    def test_zero_or_duplicate_stats_do_not_refresh_frame_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            manager = ClinicalCaptureManager(ClinicalConfig.defaults(data_dir=root, simulate=True))
+            try:
+                manager._status_queue = queue.Queue()
+                manager._status_queue.put(
+                    {
+                        "kind": "stats",
+                        "camera": "right_eye",
+                        "sequence": 10,
+                        "timestamp_ns": 10_000,
+                        "frames_in_interval": 2,
+                        "capture_fps": 240.0,
+                        "recording": False,
+                        "recorded_frames": 0,
+                    }
+                )
+                manager._drain_status()
+                first = manager._cameras["right_eye"]["last_frame_monotonic"]
+                self.assertIsNotNone(first)
+                manager._status_queue.put(
+                    {
+                        "kind": "stats",
+                        "camera": "right_eye",
+                        "sequence": 10,
+                        "timestamp_ns": 10_000,
+                        "frames_in_interval": 0,
+                        "capture_fps": 0.0,
+                        "recording": False,
+                        "recorded_frames": 0,
+                    }
+                )
+                manager._drain_status()
+                self.assertEqual(manager._cameras["right_eye"]["last_frame_monotonic"], first)
+            finally:
                 manager._status_queue = None
                 manager.close()
 
@@ -630,6 +733,31 @@ class ClinicalManagerSimulationTests(unittest.TestCase):
                 check = manager.preflight()
                 self.assertFalse(check["ready"])
                 self.assertIn("请先确认左右眼相机和画面方向", check["blocking_reasons"])
+            finally:
+                manager.close()
+
+    def test_backend_preflight_blocks_zero_fps_and_unverified_transform(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            manager = ClinicalCaptureManager(
+                ClinicalConfig.defaults(data_dir=root, simulate=False),
+                device_settings_confirmed=True,
+            )
+            try:
+                manager._state = SessionState.READY
+                now = time.monotonic()
+                for item in manager._cameras.values():
+                    item.update(
+                        {
+                            "state": "ready",
+                            "capture_fps": 0.0,
+                            "last_frame_monotonic": now,
+                            "transform_verified": False,
+                        }
+                    )
+                check = manager.preflight()
+                self.assertFalse(check["ready"])
+                self.assertTrue(any("帧率 0.0" in reason for reason in check["blocking_reasons"]))
+                self.assertTrue(any("画面方向尚未通过首帧验证" in reason for reason in check["blocking_reasons"]))
             finally:
                 manager.close()
 

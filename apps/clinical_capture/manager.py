@@ -101,6 +101,7 @@ class ClinicalCaptureManager:
             "actual": None,
             "simulated": False,
             "capture_fps": 0.0,
+            "frames_in_interval": 0,
             "recorded_frames": 0,
             "recording": False,
             "black_percent": 0.0,
@@ -266,13 +267,15 @@ class ClinicalCaptureManager:
                 minimum = float(camera.get("minimum_fps") or 0.0)
             except (TypeError, ValueError):
                 return True
-            if minimum > 0.0 and fps > 0.0 and fps < minimum:
+            if fps <= 0.0 or (minimum > 0.0 and fps < minimum):
                 return True
             try:
                 age_ms = float(camera.get("last_frame_age_ms") or 0.0)
             except (TypeError, ValueError):
                 age_ms = 0.0
             if age_ms > float(self.config.stale_frame_timeout_seconds) * 1000.0:
+                return True
+            if not self.config.simulate and not bool(camera.get("transform_verified")):
                 return True
         return False
 
@@ -452,9 +455,13 @@ class ClinicalCaptureManager:
                 if age is None or age > self.config.stale_frame_timeout_seconds:
                     (blocking if spec.required else warnings).append(f"{spec.name}: 帧流超时")
                 fps = float(item.get("capture_fps") or 0.0)
-                if fps and fps < spec.fps * self.config.minimum_fps_ratio:
+                if fps <= 0.0 or fps < spec.fps * self.config.minimum_fps_ratio:
                     (blocking if spec.required else warnings).append(
                         f"{spec.name}: 帧率 {fps:.1f} 低于 {spec.fps * self.config.minimum_fps_ratio:.1f}"
+                    )
+                if not self.config.simulate and not bool(item.get("transform_verified")):
+                    (blocking if spec.required else warnings).append(
+                        f"{spec.name}: 画面方向尚未通过首帧验证"
                     )
                 if float(item.get("black_percent") or 0.0) > self.config.max_black_percent:
                     (blocking if spec.required else warnings).append(
@@ -642,7 +649,8 @@ class ClinicalCaptureManager:
                 black = float(item.get("black_percent") or 0.0)
                 quality_ok = (
                     item.get("state") not in {"error", "offline"}
-                    and (not fps or fps >= camera.fps * self.config.minimum_fps_ratio)
+                    and fps > 0.0
+                    and fps >= camera.fps * self.config.minimum_fps_ratio
                     and black <= self.config.max_black_percent
                     and int(item.get("recorded_frames") or 0) > 0
                 )
@@ -650,6 +658,7 @@ class ClinicalCaptureManager:
                     "name": camera.name,
                     "required": camera.required,
                     "capture_fps": fps,
+                    "frames_in_interval": int(item.get("frames_in_interval") or 0),
                     "recorded_frames": int(item.get("recorded_frames") or 0),
                     "black_percent": black,
                     "read_p95_ms": float(item.get("read_p95_ms") or 0.0),
@@ -942,19 +951,43 @@ class ClinicalCaptureManager:
                         "frame_transform": payload.get("frame_transform", item.get("frame_transform")),
                     })
                 elif kind == "stats":
+                    previous_sequence = int(item.get("sequence") or 0)
+                    previous_timestamp = int(item.get("timestamp_ns") or 0)
+                    incoming_sequence = int(payload.get("sequence") or 0)
+                    incoming_timestamp = int(payload.get("timestamp_ns") or 0)
+                    interval_frames = payload.get("frames_in_interval")
+                    if interval_frames is None:
+                        # Compatibility for older/test producers: require an
+                        # advancing sequence/timestamp, except for the first
+                        # legacy packet where neither field is available.
+                        frame_advanced = (
+                            incoming_sequence > previous_sequence
+                            or incoming_timestamp > previous_timestamp
+                            or (
+                                "sequence" not in payload
+                                and "timestamp_ns" not in payload
+                                and item.get("last_frame_monotonic") is None
+                            )
+                        )
+                    else:
+                        frame_advanced = int(interval_frames or 0) > 0 and (
+                            incoming_sequence > previous_sequence
+                            or incoming_timestamp > previous_timestamp
+                        )
                     item.update({key: payload[key] for key in (
-                        "capture_fps", "recorded_frames", "recording", "black_percent", "read_p95_ms",
+                        "capture_fps", "frames_in_interval", "recorded_frames", "recording", "black_percent", "read_p95_ms",
                         "mean", "std", "sequence", "timestamp_ns", "recording_path", "recording_codec",
                         "recording_duration_s", "frame_transform", "transform_applied",
                         "transform_verified", "reconnect_count", "reconnect_attempts_total",
                         "last_reconnect_at",
                     ) if key in payload})
-                    item["last_frame_monotonic"] = update_monotonic
-                    item["read_failures"] = 0
-                    if item.get("recording"):
-                        item["state"] = "recording"
-                    elif item["state"] not in {"error", "offline"}:
-                        item["state"] = "ready"
+                    if frame_advanced:
+                        item["last_frame_monotonic"] = update_monotonic
+                        item["read_failures"] = 0
+                        if item.get("recording"):
+                            item["state"] = "recording"
+                        elif item["state"] not in {"error", "offline"}:
+                            item["state"] = "ready"
                 elif kind == "recording_started":
                     item.update({
                         "recording": True,
