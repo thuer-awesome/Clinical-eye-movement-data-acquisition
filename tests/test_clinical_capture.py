@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
+import queue
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -20,14 +23,46 @@ from apps.clinical_capture.camera_settings import (
 from apps.clinical_capture.exporter import export_session
 from apps.clinical_capture.manager import ClinicalCaptureManager
 from apps.clinical_capture.models import CameraConfig, ClinicalConfig, SessionMetadata, SessionState
-from apps.clinical_capture.pupil import PupilDetectorService, _alignment_guidance
+from apps.clinical_capture.pupil import PupilDetectorService, _alignment_direction, _alignment_guidance, guide_rect_pixels
+from apps.clinical_capture.qt_app import QT_AVAILABLE, confidence_color_rgb, direction_label, guide_rect_normalized
 from apps.clinical_capture.server import create_app
 from apps.clinical_capture.storage import SessionStore
-from apps.clinical_capture.worker import _close_recording, _open_recording, normalize_frame
+from apps.clinical_capture.worker import _close_recording, _open_recording, _reconnect_capture, normalize_frame
 from apps.multicamera_capture.shared_frame import FrameSnapshot
 
 
 class ClinicalModelTests(unittest.TestCase):
+    def test_alignment_direction_is_structured_for_qt_guidance(self) -> None:
+        self.assertEqual(
+            _alignment_direction(
+                width=320,
+                height=240,
+                center_x=24.0,
+                center_y=210.0,
+                geometry_ok=True,
+                center_tolerance=0.30,
+            ),
+            "left_down",
+        )
+        self.assertEqual(direction_label("left_down"), "左下")
+
+    def test_operator_guide_is_wide_and_independent_of_gate(self) -> None:
+        rect = guide_rect_pixels(320, 240, margin_x=0.16, margin_y=0.20)
+        self.assertEqual(rect, (51, 48, 268, 191))
+        config = ClinicalConfig.defaults(simulate=True)
+        self.assertEqual(guide_rect_normalized(config), (0.16, 0.20, 0.84, 0.80))
+        self.assertIn(QT_AVAILABLE, (True, False))
+
+    def test_confidence_color_transitions_from_low_to_high(self) -> None:
+        low = confidence_color_rgb(0.0, 0.6)
+        near = confidence_color_rgb(0.3, 0.6)
+        high = confidence_color_rgb(0.6, 0.6)
+        above = confidence_color_rgb(0.95, 0.6)
+        self.assertEqual(low, (239, 91, 91))
+        self.assertGreater(near[1], low[1])
+        self.assertEqual(high, (82, 205, 142))
+        self.assertEqual(above, high)
+
     def test_alignment_guidance_points_toward_the_offset(self) -> None:
         message = _alignment_guidance(
             "right_eye",
@@ -69,6 +104,35 @@ class ClinicalModelTests(unittest.TestCase):
             time.sleep(0.16)
             self.assertTrue(service.status()["alignment"]["ready"])
             self.assertAlmostEqual(service.status()["alignment"]["progress"], 1.0, places=2)
+        finally:
+            service.close()
+
+    def test_operator_guide_overlay_does_not_change_detection_validity(self) -> None:
+        class Detector:
+            def detect(self, _gray):
+                return {
+                    "confidence": 0.95,
+                    "ellipse": {"center": (32.0, 24.0), "axes": (18.0, 12.0), "angle": 0.0},
+                    "diameter": 15.0,
+                }
+
+        service = PupilDetectorService(
+            "right_eye",
+            0,
+            owner=None,
+            alignment_hold_seconds=0.08,
+            alignment_max_age_seconds=0.5,
+        )
+        snapshot = FrameSnapshot(1, time.perf_counter_ns(), np.zeros((48, 64), dtype=np.uint8))
+        try:
+            service._detect_snapshot(snapshot, Detector())
+            before = service.status()
+            frame = service.overlay(snapshot.frame, guide_rect=(0.12, 0.10, 0.88, 0.90))
+            self.assertEqual(frame.shape, (48, 64, 3))
+            after = service.status()
+            self.assertEqual(before["valid"], after["valid"])
+            self.assertEqual(before["confidence"], after["confidence"])
+            self.assertEqual(before["alignment"]["center_ok"], after["alignment"]["center_ok"])
         finally:
             service.close()
 
@@ -129,6 +193,76 @@ class ClinicalModelTests(unittest.TestCase):
         self.assertEqual(config.jpeg_quality, 95)
         self.assertTrue(all(camera.fourcc == "MJPG" for camera in config.cameras))
         self.assertTrue(all(camera.record_fourcc == "MJPG" for camera in config.cameras))
+
+    def test_camera_reconnect_is_bounded_and_reports_attempts(self) -> None:
+        spec = CameraConfig(name="eye", index=0, width=4, height=3, fps=240)
+        statuses: queue.Queue = queue.Queue()
+        stop_event = threading.Event()
+
+        class FakeCapture:
+            def __init__(self) -> None:
+                self.released = False
+
+            def release(self) -> None:
+                self.released = True
+
+        old = FakeCapture()
+        fresh = FakeCapture()
+        calls = iter([RuntimeError("device busy"), fresh])
+
+        def open_capture(_spec):
+            value = next(calls)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch("apps.clinical_capture.worker._open_capture", side_effect=open_capture), patch(
+            "apps.clinical_capture.worker._actual_mode", return_value="4x3@240.0 FOURCC='MJPG'"
+        ):
+            result, actual, used = _reconnect_capture(
+                spec,
+                old,
+                statuses,
+                stop_event,
+                attempts=2,
+                delay_seconds=0.05,
+                reconnect_count=1,
+            )
+
+        self.assertIs(result, fresh)
+        self.assertEqual(actual, "4x3@240.0 FOURCC='MJPG'")
+        self.assertEqual(used, 2)
+        self.assertTrue(old.released)
+        events = []
+        while not statuses.empty():
+            events.append(statuses.get_nowait())
+        self.assertEqual([event["kind"] for event in events], ["reconnecting", "reconnect_failed", "reconnecting", "reconnected"])
+        self.assertEqual(events[-1]["frame_transform"], "none")
+
+    def test_reconnect_messages_do_not_refresh_frame_watchdog(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            manager = ClinicalCaptureManager(ClinicalConfig.defaults(data_dir=root, simulate=True))
+            try:
+                manager._status_queue = queue.Queue()
+                manager._drain_status()
+                manager._status_queue.put(
+                    {
+                        "kind": "stats",
+                        "camera": "right_eye",
+                        "capture_fps": 240.0,
+                        "recording": False,
+                        "recorded_frames": 0,
+                    }
+                )
+                manager._drain_status()
+                first = manager._cameras["right_eye"]["last_frame_monotonic"]
+                manager._status_queue.put({"kind": "reconnecting", "camera": "right_eye", "attempt": 1, "attempts": 3})
+                manager._drain_status()
+                self.assertEqual(manager._cameras["right_eye"]["last_frame_monotonic"], first)
+            finally:
+                # Restore the multiprocessing queue contract used by close().
+                manager._status_queue = None
+                manager.close()
 
     def test_camera_settings_validate_mapping_and_preserve_capture_parameters(self) -> None:
         base = ClinicalConfig.defaults(simulate=True)
@@ -267,6 +401,11 @@ class ClinicalExportTests(unittest.TestCase):
                         "name": "right_eye",
                         "required": True,
                         "recorded_frames": 5,
+                        "frame_transform": "rotate_180",
+                        "transform_applied": True,
+                        "transform_verified": True,
+                        "reconnect_count": 1,
+                        "reconnect_attempts_total": 2,
                         "quality_ok": True,
                     }
                 },
@@ -282,9 +421,12 @@ class ClinicalExportTests(unittest.TestCase):
             pupil_report = json.loads((record.path / "pupil_report.json").read_text(encoding="utf-8"))
             self.assertEqual(pupil_report["session_id"], record.session_id)
             self.assertEqual(pupil_report["eyes"]["right_eye"]["valid_samples"], 1)
+            self.assertTrue(pupil_report["eyes"]["right_eye"]["camera_runtime"]["transform_verified"])
+            self.assertEqual(pupil_report["eyes"]["right_eye"]["camera_runtime"]["reconnect_count"], 1)
             clinical_report = json.loads((record.path / "clinical_report.json").read_text(encoding="utf-8"))
             self.assertEqual(clinical_report["session_id"], record.session_id)
             self.assertEqual(clinical_report["quality"]["cameras"]["right_eye"]["recorded_frames"], 5)
+            self.assertEqual(clinical_report["quality"]["cameras"]["right_eye"]["reconnect_attempts_total"], 2)
             manifest = json.loads((record.path / "export_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["manifest_self_excluded"])
             inventory = {item["path"]: item for item in manifest["files"]}
