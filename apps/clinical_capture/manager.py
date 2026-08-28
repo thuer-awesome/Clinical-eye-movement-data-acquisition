@@ -110,7 +110,16 @@ class ClinicalCaptureManager:
             "sequence": 0,
             "timestamp_ns": 0,
             "last_frame_age_ms": None,
+            "last_frame_monotonic": None,
             "last_update_monotonic": None,
+            "reconnect_count": 0,
+            "reconnect_attempts_total": 0,
+            "read_failures": 0,
+            "reconnect_attempt": 0,
+            "reconnect_attempts": 0,
+            "last_reconnect_at": None,
+            "transform_applied": False,
+            "transform_verified": False,
             "recording_path": None,
             "recording_codec": None,
             "recording_duration_s": 0.0,
@@ -130,6 +139,7 @@ class ClinicalCaptureManager:
                 "frame_height": 0,
                 "geometry_ok": False,
                 "center_ok": False,
+                "direction": "search",
                 "guidance": None,
                 "alignment": {
                     "state": "starting",
@@ -138,6 +148,7 @@ class ClinicalCaptureManager:
                     "hold_seconds": 0.0,
                     "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
                     "center_ok": False,
+                    "direction": "search",
                     "fresh": False,
                     "age_ms": None,
                     "confidence": 0.0,
@@ -182,6 +193,9 @@ class ClinicalCaptureManager:
                         self.config.simulate,
                         self.config.status_interval_seconds,
                         self.config.jpeg_quality,
+                        self.config.camera_read_failure_threshold,
+                        self.config.camera_reconnect_attempts,
+                        self.config.camera_reconnect_delay_seconds,
                     ),
                 )
                 self._processes[camera.name] = process
@@ -348,6 +362,7 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "direction": "search",
                             "guidance": "瞳孔算法不可用，请检查安装或查看日志",
                             "alignment": {
                                 "state": "error",
@@ -356,6 +371,7 @@ class ClinicalCaptureManager:
                                 "hold_seconds": 0.0,
                                 "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
                                 "center_ok": False,
+                                "direction": "search",
                                 "fresh": False,
                                 "age_ms": None,
                                 "confidence": 0.0,
@@ -377,9 +393,13 @@ class ClinicalCaptureManager:
                 warnings.append(self.device_settings_error)
             for spec in self.config.cameras:
                 item = dict(self._cameras[spec.name])
-                last_update = item.get("last_update_monotonic")
-                age = None if last_update is None else max(0.0, now - float(last_update))
+                # Only a status carrying a real frame may refresh the frame
+                # watchdog.  Reconnect/error messages must not mask a stalled
+                # stream by looking like fresh data.
+                last_frame = item.get("last_frame_monotonic")
+                age = None if last_frame is None else max(0.0, now - float(last_frame))
                 item["last_frame_age_ms"] = None if age is None else round(age * 1000.0, 1)
+                item.pop("last_frame_monotonic", None)
                 item.pop("last_update_monotonic", None)
                 service = self._pupil_services.get(spec.name)
                 if service is not None:
@@ -397,6 +417,21 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "direction": "search",
+                            "alignment": {
+                                "state": "error",
+                                "ready": False,
+                                "progress": 0.0,
+                                "hold_seconds": 0.0,
+                                "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "center_ok": False,
+                                "direction": "search",
+                                "fresh": False,
+                                "age_ms": None,
+                                "confidence": 0.0,
+                                "threshold": self.config.pupil_confidence_threshold,
+                                "guidance": "瞳孔算法状态读取失败，请检查日志",
+                            },
                             "error": str(error),
                         }
                 cameras[spec.name] = item
@@ -404,6 +439,12 @@ class ClinicalCaptureManager:
                     (blocking if spec.required else warnings).append(
                         f"{spec.name}: {item.get('error') or '采集进程错误'}"
                     )
+                    continue
+                if item["state"] == "reconnecting":
+                    attempt = int(item.get("reconnect_attempt") or 0)
+                    attempts = int(item.get("reconnect_attempts") or 0)
+                    progress = f"（第 {attempt}/{attempts} 次）" if attempts else ""
+                    (blocking if spec.required else warnings).append(f"{spec.name}: 正在重连{progress}")
                     continue
                 if item["state"] not in {"ready", "recording"}:
                     (blocking if spec.required else warnings).append(f"{spec.name}: 尚未就绪")
@@ -474,6 +515,11 @@ class ClinicalCaptureManager:
                     "progress": round(max(0.0, min(1.0, alignment_progress)), 3),
                     "hold_seconds": self.config.pupil_alignment_hold_seconds,
                     "confidence_threshold": self.config.pupil_confidence_threshold,
+                    "operator_guide": {
+                        "margin_x": self.config.preview_guide_margin_x,
+                        "margin_y": self.config.preview_guide_margin_y,
+                        "gating": False,
+                    },
                     "guidance": alignment_guidance,
                 },
             }
@@ -518,6 +564,7 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "direction": "search",
                             "guidance": "瞳孔数据文件创建失败，请检查会话目录权限",
                             "alignment": {
                                 "state": "error",
@@ -526,6 +573,7 @@ class ClinicalCaptureManager:
                                 "hold_seconds": 0.0,
                                 "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
                                 "center_ok": False,
+                                "direction": "search",
                                 "fresh": False,
                                 "age_ms": None,
                                 "confidence": 0.0,
@@ -607,6 +655,12 @@ class ClinicalCaptureManager:
                     "read_p95_ms": float(item.get("read_p95_ms") or 0.0),
                     "actual": item.get("actual"),
                     "recording_codec": item.get("recording_codec"),
+                    "frame_transform": item.get("frame_transform", camera.frame_transform),
+                    "transform_applied": bool(item.get("transform_applied")),
+                    "transform_verified": bool(item.get("transform_verified")),
+                    "reconnect_count": int(item.get("reconnect_count") or 0),
+                    "reconnect_attempts_total": int(item.get("reconnect_attempts_total") or 0),
+                    "last_reconnect_at": item.get("last_reconnect_at"),
                     "simulated": bool(item.get("simulated")),
                     "quality_ok": quality_ok,
                     "error": item.get("error"),
@@ -671,7 +725,18 @@ class ClinicalCaptureManager:
                 },
             }
 
-    def preview_jpeg(self, camera_name: str) -> bytes | None:
+    def preview_jpeg(
+        self,
+        camera_name: str,
+        *,
+        guide_rect: tuple[float, float, float, float] | None = None,
+    ) -> bytes | None:
+        """Return the newest annotated frame as JPEG.
+
+        ``guide_rect`` is an optional normalized operator rectangle. It is
+        rendered only in the preview and never participates in pupil validity
+        or the recording gate.
+        """
         with self._lock:
             owner = self._owners.get(camera_name)
             pupil = self._pupil_services.get(camera_name)
@@ -683,7 +748,7 @@ class ClinicalCaptureManager:
         frame = snapshot.frame
         if pupil is not None:
             try:
-                frame = pupil.overlay(frame)
+                frame = pupil.overlay(frame, guide_rect=guide_rect)
             except Exception:
                 if frame.ndim == 2:
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
@@ -800,7 +865,7 @@ class ClinicalCaptureManager:
                             should_abort = True
                             reason = f"{camera.name} 采集进程异常，录制已安全结束"
                             break
-                        age = item.get("last_update_monotonic")
+                        age = item.get("last_frame_monotonic")
                         if camera.required and age is not None and time.monotonic() - float(age) > self.config.stale_frame_timeout_seconds:
                             should_abort = True
                             reason = f"{camera.name} 帧流超时，录制已安全结束"
@@ -823,17 +888,69 @@ class ClinicalCaptureManager:
             with self._lock:
                 item = self._cameras[camera_name]
                 kind = payload.get("kind")
-                item["last_update_monotonic"] = time.monotonic()
+                update_monotonic = time.monotonic()
+                item["last_update_monotonic"] = update_monotonic
                 if kind == "starting":
                     item["state"] = "starting"
                 elif kind == "opened":
-                    item.update({"state": "ready", "actual": payload.get("actual"), "simulated": bool(payload.get("simulated")), "error": None})
+                    item.update({
+                        "state": "ready",
+                        "actual": payload.get("actual"),
+                        "simulated": bool(payload.get("simulated")),
+                        "error": None,
+                        "frame_transform": payload.get("frame_transform", item.get("frame_transform")),
+                        "transform_applied": bool(payload.get("transform_applied")),
+                        "transform_verified": bool(payload.get("transform_verified")),
+                        "reconnect_count": int(payload.get("reconnect_count") or 0),
+                    })
+                elif kind == "transform_verified":
+                    item.update({
+                        "frame_transform": payload.get("frame_transform", item.get("frame_transform")),
+                        "transform_applied": True,
+                        "transform_verified": True,
+                    })
+                elif kind == "read_failure":
+                    item["read_failures"] = int(payload.get("consecutive_failures") or 0)
+                    item["reconnect_count"] = int(payload.get("reconnect_count") or item.get("reconnect_count") or 0)
+                elif kind == "reconnecting":
+                    item.update({
+                        "state": "reconnecting",
+                        "reconnect_attempt": int(payload.get("attempt") or 0),
+                        "reconnect_attempts": int(payload.get("attempts") or 0),
+                        "reconnect_count": int(payload.get("reconnect_count") or item.get("reconnect_count") or 0),
+                    })
+                elif kind == "reconnect_failed":
+                    item.update({
+                        "state": "reconnecting",
+                        "reconnect_attempt": int(payload.get("attempt") or 0),
+                        "reconnect_attempts": int(payload.get("attempts") or 0),
+                        "error": str(payload.get("message") or "相机重连失败，正在继续重试"),
+                    })
+                elif kind == "reconnected":
+                    attempts_used = int(payload.get("attempt") or 0)
+                    item.update({
+                        "state": "recording" if item.get("recording") else "ready",
+                        "actual": payload.get("actual") or item.get("actual"),
+                        "error": None,
+                        "reconnect_count": int(payload.get("reconnect_count") or item.get("reconnect_count") or 0),
+                        "reconnect_attempt": attempts_used,
+                        # Stats will replace this with the worker's exact
+                        # cumulative value; this immediate estimate keeps a
+                        # stop taken right after recovery auditable.
+                        "reconnect_attempts_total": int(item.get("reconnect_attempts_total") or 0) + attempts_used,
+                        "last_reconnect_at": payload.get("last_reconnect_at") or utc_now(),
+                        "frame_transform": payload.get("frame_transform", item.get("frame_transform")),
+                    })
                 elif kind == "stats":
                     item.update({key: payload[key] for key in (
                         "capture_fps", "recorded_frames", "recording", "black_percent", "read_p95_ms",
                         "mean", "std", "sequence", "timestamp_ns", "recording_path", "recording_codec",
-                        "recording_duration_s",
+                        "recording_duration_s", "frame_transform", "transform_applied",
+                        "transform_verified", "reconnect_count", "reconnect_attempts_total",
+                        "last_reconnect_at",
                     ) if key in payload})
+                    item["last_frame_monotonic"] = update_monotonic
+                    item["read_failures"] = 0
                     if item.get("recording"):
                         item["state"] = "recording"
                     elif item["state"] not in {"error", "offline"}:

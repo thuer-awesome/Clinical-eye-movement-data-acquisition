@@ -443,6 +443,12 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
         camera_stats = {}
     threshold_value = _number(config, "pupil_confidence_threshold", 0.6)
     threshold = 0.6 if threshold_value is None else threshold_value
+    configured_cameras = config.get("cameras") if isinstance(config.get("cameras"), list) else []
+    configured_transforms = {
+        str(value.get("name")): value.get("frame_transform", "none")
+        for value in configured_cameras
+        if isinstance(value, Mapping)
+    }
     eyes: dict[str, dict[str, Any]] = {}
     for eye_name in ("right_eye", "left_eye"):
         rows = _read_rows(root / f"{eye_name}_pupil.csv")
@@ -480,6 +486,14 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             "latency_p95_ms": pupil_summary.get("latency_p95_ms"),
             "alignment_at_start": pupil_summary.get("alignment_at_start", {}),
             "alignment_at_stop": pupil_summary.get("alignment_at_stop", {}),
+            "camera_runtime": {
+                "frame_transform": detector_summary.get("frame_transform", configured_transforms.get(eye_name, "none")),
+                "transform_applied": bool(detector_summary.get("transform_applied", False)),
+                "transform_verified": bool(detector_summary.get("transform_verified", False)),
+                "reconnect_count": int(detector_summary.get("reconnect_count") or 0),
+                "reconnect_attempts_total": int(detector_summary.get("reconnect_attempts_total") or 0),
+                "last_reconnect_at": detector_summary.get("last_reconnect_at"),
+            },
         }
 
     report = {
@@ -493,6 +507,11 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             "center_tolerance": config.get("pupil_alignment_center_tolerance", 0.30),
             "max_detection_age_seconds": config.get("pupil_alignment_max_age_seconds", 0.75),
             "confidence_threshold": threshold,
+            "operator_guide": {
+                "margin_x": config.get("preview_guide_margin_x", 0.16),
+                "margin_y": config.get("preview_guide_margin_y", 0.20),
+                "purpose": "centered eye-orbit framing aid only; never used to mark a pupil sample valid",
+            },
         },
         "eyes": eyes,
         "artifacts": {

@@ -34,6 +34,9 @@ def capture_worker(
     simulate: bool,
     status_interval_seconds: float,
     record_quality: int = 95,
+    read_failure_threshold: int = 3,
+    reconnect_attempts: int = 3,
+    reconnect_delay_seconds: float = 0.20,
 ) -> None:
     """Capture one camera in its own process.
 
@@ -62,6 +65,15 @@ def capture_worker(
     read_durations_ms: list[float] = []
     last_mean = 0.0
     last_std = 0.0
+    consecutive_read_failures = 0
+    reconnect_count = 0
+    reconnect_attempts_total = 0
+    last_reconnect_at: str | None = None
+    transform_verified = False
+
+    read_failure_threshold = max(1, min(20, int(read_failure_threshold)))
+    reconnect_attempts = max(1, min(20, int(reconnect_attempts)))
+    reconnect_delay_seconds = max(0.05, min(5.0, float(reconnect_delay_seconds)))
 
     try:
         cv2.setNumThreads(1)
@@ -80,6 +92,10 @@ def capture_worker(
                 "index": spec.index,
                 "actual": actual_mode,
                 "simulated": simulate,
+                "frame_transform": spec.frame_transform,
+                "transform_applied": False,
+                "transform_verified": False,
+                "reconnect_count": reconnect_count,
             },
         )
         # Camera opening can take several seconds on DirectShow.  Start the FPS
@@ -96,10 +112,52 @@ def capture_worker(
             else:
                 success, frame = capture.read() if capture is not None else (False, None)
                 if not success or frame is None:
-                    raise RuntimeError("camera read returned no frame")
+                    consecutive_read_failures += 1
+                    _send(
+                        status_queue,
+                        {
+                            "kind": "read_failure",
+                            "camera": spec.name,
+                            "consecutive_failures": consecutive_read_failures,
+                            "reconnect_count": reconnect_count,
+                        },
+                    )
+                    if consecutive_read_failures < read_failure_threshold:
+                        if stop_event.wait(reconnect_delay_seconds):
+                            break
+                        continue
+                    capture, actual_mode, used_attempts = _reconnect_capture(
+                        spec,
+                        capture,
+                        status_queue,
+                        stop_event,
+                        attempts=reconnect_attempts,
+                        delay_seconds=reconnect_delay_seconds,
+                        reconnect_count=reconnect_count + 1,
+                    )
+                    reconnect_count += 1
+                    reconnect_attempts_total += used_attempts
+                    last_reconnect_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    consecutive_read_failures = 0
+                    continue
+                consecutive_read_failures = 0
                 target_period = 0.0
             read_finished_ns = time.perf_counter_ns()
             normalized = normalize_frame(frame, spec)
+            if not transform_verified:
+                # The transform is applied to the frame before it enters both
+                # shared memory and the recorder.  This marker is an auditable
+                # runtime fact, while the raw pixels remain untouched by UI.
+                transform_verified = True
+                _send(
+                    status_queue,
+                    {
+                        "kind": "transform_verified",
+                        "camera": spec.name,
+                        "frame_transform": spec.frame_transform,
+                        "sequence": frame_sequence + 1,
+                    },
+                )
             capture_timestamp_ns = (read_started_ns + read_finished_ns) // 2
             frame_sequence = frame_writer.publish(normalized, capture_timestamp_ns)
             interval_frames += 1
@@ -190,6 +248,12 @@ def capture_worker(
                         "timestamp_ns": capture_timestamp_ns,
                         "recording_path": recording_path,
                         "recording_codec": recording_codec,
+                        "frame_transform": spec.frame_transform,
+                        "transform_applied": True,
+                        "transform_verified": transform_verified,
+                        "reconnect_count": reconnect_count,
+                        "reconnect_attempts_total": reconnect_attempts_total,
+                        "last_reconnect_at": last_reconnect_at,
                         "recording_duration_s": (
                             max(0.0, (capture_timestamp_ns - recording_started_ns) / 1_000_000_000.0)
                             if recording and recording_started_ns
@@ -290,6 +354,75 @@ def _open_capture(spec: CameraConfig) -> cv2.VideoCapture:
         capture.release()
         raise RuntimeError("could not open camera")
     return capture
+
+
+def _reconnect_capture(
+    spec: CameraConfig,
+    capture: cv2.VideoCapture | None,
+    status_queue: Any,
+    stop_event: Any,
+    *,
+    attempts: int,
+    delay_seconds: float,
+    reconnect_count: int,
+) -> tuple[cv2.VideoCapture, str, int]:
+    """Reopen a DirectShow handle after a bounded run of failed reads.
+
+    Some UVC drivers report a transient empty frame when the USB controller
+    recovers.  Releasing the old handle before opening a new one prevents the
+    common ``isOpened() == True``/one-fps zombie state.  The worker remains the
+    sole owner of the device, so successful recovery does not require a full
+    application restart and does not break the active AVI session.
+    """
+    if capture is not None:
+        capture.release()
+    errors: list[str] = []
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        _send(
+            status_queue,
+            {
+                "kind": "reconnecting",
+                "camera": spec.name,
+                "attempt": attempt,
+                "attempts": max(1, int(attempts)),
+                "reconnect_count": reconnect_count,
+            },
+        )
+        if stop_event.wait(max(0.05, float(delay_seconds))):
+            raise RuntimeError("camera reconnect cancelled during shutdown")
+        candidate: cv2.VideoCapture | None = None
+        try:
+            candidate = _open_capture(spec)
+            actual = _actual_mode(candidate)
+            _send(
+                status_queue,
+                {
+                    "kind": "reconnected",
+                    "camera": spec.name,
+                    "actual": actual,
+                    "attempt": attempt,
+                    "reconnect_count": reconnect_count,
+                    "frame_transform": spec.frame_transform,
+                },
+            )
+            return candidate, actual, attempt
+        except Exception as error:
+            if candidate is not None:
+                candidate.release()
+            errors.append(str(error))
+            _send(
+                status_queue,
+                {
+                    "kind": "reconnect_failed",
+                    "camera": spec.name,
+                    "attempt": attempt,
+                    "attempts": max(1, int(attempts)),
+                    "message": str(error),
+                    "reconnect_count": reconnect_count,
+                },
+            )
+    detail = "; ".join(errors[-3:]) or "unknown camera open error"
+    raise RuntimeError(f"camera read failed; reconnect exhausted after {max(1, int(attempts))} attempts: {detail}")
 
 
 def _open_recording(

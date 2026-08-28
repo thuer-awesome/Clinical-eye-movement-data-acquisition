@@ -132,11 +132,21 @@ class ClinicalConfig:
     pupil_alignment_hold_seconds: float = 1.5
     pupil_alignment_center_tolerance: float = 0.30
     pupil_alignment_max_age_seconds: float = 0.75
+    # The centered guide approximates the camera's frontal eye-orbit range. It
+    # is a visual aid only; pupil validity and the recording gate never use
+    # these margins.
+    preview_guide_margin_x: float = 0.16
+    preview_guide_margin_y: float = 0.20
     status_interval_seconds: float = 1.0
     startup_timeout_seconds: float = 12.0
     recording_ack_timeout_seconds: float = 8.0
     shutdown_timeout_seconds: float = 5.0
     stale_frame_timeout_seconds: float = 2.5
+    # A short USB/DirectShow hiccup must not terminate a clinical session.
+    # Workers retry failed reads, then reopen the handle with bounded backoff.
+    camera_read_failure_threshold: int = 3
+    camera_reconnect_attempts: int = 3
+    camera_reconnect_delay_seconds: float = 0.20
     # Two 240-fps cameras share one USB transport on the field workstation;
     # measured stable throughput is about 162-167 fps per eye.  Keep a
     # conservative, explicit floor that accepts that validated operating point
@@ -177,9 +187,12 @@ class ClinicalConfig:
             "cameras", "data_dir", "preview_fps", "pupil_detector_fps",
             "pupil_confidence_threshold", "pupil_alignment_hold_seconds",
             "pupil_alignment_center_tolerance", "pupil_alignment_max_age_seconds",
+            "preview_guide_margin_x", "preview_guide_margin_y",
             "status_interval_seconds",
             "startup_timeout_seconds", "recording_ack_timeout_seconds",
             "shutdown_timeout_seconds", "stale_frame_timeout_seconds",
+            "camera_read_failure_threshold", "camera_reconnect_attempts",
+            "camera_reconnect_delay_seconds",
             "minimum_fps_ratio", "max_black_percent", "jpeg_quality", "simulate",
         }
         extra = set(payload) - allowed
@@ -240,6 +253,15 @@ class ClinicalConfig:
                 or float(value) <= 0
             ):
                 raise ValueError(f"{name} must be a positive finite number")
+        for name in ("preview_guide_margin_x", "preview_guide_margin_y"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) < 0.45
+            ):
+                raise ValueError(f"{name} must be between 0 and 0.45")
         if (
             isinstance(self.pupil_alignment_center_tolerance, bool)
             or not isinstance(self.pupil_alignment_center_tolerance, (int, float))
@@ -250,10 +272,15 @@ class ClinicalConfig:
         for name in (
             "status_interval_seconds", "startup_timeout_seconds", "recording_ack_timeout_seconds",
             "shutdown_timeout_seconds", "stale_frame_timeout_seconds",
+            "camera_reconnect_delay_seconds",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"{name} must be a positive finite number")
+        for name in ("camera_read_failure_threshold", "camera_reconnect_attempts"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 20:
+                raise ValueError(f"{name} must be an integer between 1 and 20")
         if not isinstance(self.minimum_fps_ratio, (int, float)) or isinstance(self.minimum_fps_ratio, bool) or not 0 < float(self.minimum_fps_ratio) <= 1:
             raise ValueError("minimum_fps_ratio must be in (0, 1]")
         if not isinstance(self.max_black_percent, (int, float)) or isinstance(self.max_black_percent, bool) or not 0 <= float(self.max_black_percent) <= 100:
@@ -277,10 +304,15 @@ class ClinicalConfig:
             "pupil_alignment_hold_seconds": self.pupil_alignment_hold_seconds,
             "pupil_alignment_center_tolerance": self.pupil_alignment_center_tolerance,
             "pupil_alignment_max_age_seconds": self.pupil_alignment_max_age_seconds,
+            "preview_guide_margin_x": self.preview_guide_margin_x,
+            "preview_guide_margin_y": self.preview_guide_margin_y,
             "status_interval_seconds": self.status_interval_seconds,
             "startup_timeout_seconds": self.startup_timeout_seconds,
             "recording_ack_timeout_seconds": self.recording_ack_timeout_seconds,
             "stale_frame_timeout_seconds": self.stale_frame_timeout_seconds,
+            "camera_read_failure_threshold": self.camera_read_failure_threshold,
+            "camera_reconnect_attempts": self.camera_reconnect_attempts,
+            "camera_reconnect_delay_seconds": self.camera_reconnect_delay_seconds,
             "minimum_fps_ratio": self.minimum_fps_ratio,
             "max_black_percent": self.max_black_percent,
             "jpeg_quality": self.jpeg_quality,

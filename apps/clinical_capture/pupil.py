@@ -79,6 +79,7 @@ def _empty_detection(
         "frame_height": 0,
         "geometry_ok": False,
         "center_ok": False,
+        "direction": "search",
         "guidance": None,
         "alignment": {
             "state": state,
@@ -87,6 +88,7 @@ def _empty_detection(
             "hold_seconds": 0.0,
             "required_hold_seconds": float(alignment_hold_seconds),
             "center_ok": False,
+            "direction": "search",
             "guidance": None,
         },
         "error": error,
@@ -133,6 +135,56 @@ def _alignment_guidance(
             f"（置信度 {confidence:.2f}，目标 ≥ {threshold:.2f}）"
         )
     return f"{eye_label}瞳孔已居中，请保持不动，正在确认稳定性"
+
+
+def _alignment_direction(
+    *,
+    width: int,
+    height: int,
+    center_x: float | None,
+    center_y: float | None,
+    geometry_ok: bool,
+    center_tolerance: float,
+) -> str:
+    """Return the observed pupil offset as a stable, UI-friendly token.
+
+    The token describes where the pupil appears in the image (for example
+    ``left_down``), not a confidence result.  The Qt UI uses it to draw an
+    arrow while the backend continues to use only the detector geometry and
+    confidence for validity.
+    """
+    if not geometry_ok or width <= 0 or height <= 0 or center_x is None or center_y is None:
+        return "search"
+    dx = (float(center_x) / float(width)) - 0.5
+    dy = (float(center_y) / float(height)) - 0.5
+    horizontal = "left" if dx < -center_tolerance else "right" if dx > center_tolerance else ""
+    vertical = "up" if dy < -center_tolerance else "down" if dy > center_tolerance else ""
+    if horizontal and vertical:
+        return f"{horizontal}_{vertical}"
+    return horizontal or vertical or "center"
+
+
+def guide_rect_pixels(
+    width: int,
+    height: int,
+    *,
+    margin_x: float = 0.16,
+    margin_y: float = 0.20,
+) -> tuple[int, int, int, int]:
+    """Return a large, centered operator guide rectangle in pixels.
+
+    This rectangle is deliberately separate from ``center_ok`` and is never
+    consulted by the detector or recording gate.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    margin_x = max(0.0, min(0.44, float(margin_x)))
+    margin_y = max(0.0, min(0.44, float(margin_y)))
+    left = int(round(width * margin_x))
+    top = int(round(height * margin_y))
+    right = max(left + 1, int(round(width * (1.0 - margin_x))) - 1)
+    bottom = max(top + 1, int(round(height * (1.0 - margin_y))) - 1)
+    return left, top, right, bottom
 
 
 class PupilDetectorService:
@@ -267,8 +319,18 @@ class PupilDetectorService:
             summary["confidence_threshold"] = self.confidence_threshold
             return summary
 
-    def overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Return a BGR preview with the most recent valid pupil annotation."""
+    def overlay(
+        self,
+        frame: np.ndarray,
+        *,
+        guide_rect: tuple[float, float, float, float] | None = None,
+    ) -> np.ndarray:
+        """Return a BGR preview with pupil annotation and an optional guide.
+
+        ``guide_rect`` is normalized ``(left, top, right, bottom)``.  It is
+        intentionally rendered after the image conversion and has no effect
+        on detector validity or alignment state.
+        """
         if frame.ndim == 2:
             preview = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         elif frame.ndim == 3 and frame.shape[2] == 1:
@@ -306,6 +368,18 @@ class PupilDetectorService:
             label = "PUPIL --"
             color = (80, 100, 255)
         cv2.putText(preview, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+        if guide_rect is not None:
+            try:
+                left_n, top_n, right_n, bottom_n = (float(value) for value in guide_rect)
+                height, width = preview.shape[:2]
+                left = max(0, min(width - 1, int(round(left_n * width))))
+                top = max(0, min(height - 1, int(round(top_n * height))))
+                right = max(left + 1, min(width - 1, int(round(right_n * width))))
+                bottom = max(top + 1, min(height - 1, int(round(bottom_n * height))))
+                cv2.rectangle(preview, (left, top), (right, bottom), (255, 190, 50), 1, cv2.LINE_AA)
+            except (TypeError, ValueError, OverflowError):
+                # A preview aid must never make the detector/preview fail.
+                pass
         return preview
 
     def _run(self) -> None:
@@ -403,6 +477,14 @@ class PupilDetectorService:
             and abs((center_x / max(1.0, float(frame_width))) - 0.5) <= self.alignment_center_tolerance
             and abs((center_y / max(1.0, float(frame_height))) - 0.5) <= self.alignment_center_tolerance
         )
+        direction = _alignment_direction(
+            width=frame_width,
+            height=frame_height,
+            center_x=center_x,
+            center_y=center_y,
+            geometry_ok=geometry_ok,
+            center_tolerance=self.alignment_center_tolerance,
+        )
         guidance = _alignment_guidance(
             self.camera_name,
             width=frame_width,
@@ -450,6 +532,7 @@ class PupilDetectorService:
                 "geometry_ok": geometry_ok,
                 "center_ok": center_ok,
                 "alignment_eligible": alignment_eligible,
+                "direction": direction,
                 "guidance": guidance,
                 "error": error,
             }
@@ -548,6 +631,11 @@ class PupilDetectorService:
             guidance = "检测帧已过期，请保持相机稳定并重新对准"
         elif latest_state == "error" and latest.get("error"):
             guidance = str(latest.get("error"))
+        direction = str(latest.get("direction") or "search")
+        if ready:
+            direction = "ready"
+        elif eligible:
+            direction = "holding"
         return {
             "state": state,
             "ready": ready,
@@ -555,6 +643,7 @@ class PupilDetectorService:
             "hold_seconds": round(min(hold_seconds, self.alignment_hold_seconds), 3),
             "required_hold_seconds": round(self.alignment_hold_seconds, 3),
             "center_ok": bool(latest.get("center_ok")),
+            "direction": direction,
             "fresh": fresh,
             "age_ms": None if age_ms is None else round(age_ms, 1),
             "confidence": round(_finite_float(latest.get("confidence")), 4),
