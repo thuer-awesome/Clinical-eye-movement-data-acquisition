@@ -37,10 +37,12 @@ latency, eye role, and frame number burned in.
 without opening the video editor.
 *_frames.csv: one row per written video frame with capture sequence and
 monotonic timestamp.
-*_pupil.csv: pupil validity, geometry, confidence, and detector latency for
-each detector sample.
+*_pupil.csv: pupil validity, geometry, confidence, detector latency, and the
+quality acceptance/rejection fields (`quality_ok`, `rejected_reason`, and
+`temporal_distance`) for each detector sample.
 pupil_report.json: structured per-eye detection summary, confidence statistics,
-alignment-gate settings, and links to the review artifacts.
+quality-filter statistics, alignment-gate settings, and links to the review
+artifacts.
 clinical_report.json: clinician-facing de-identified session summary with
 camera quality, pupil quality, screening note, and artifact links.
 quality.json: per-camera frame-rate, black-frame, and recording quality checks.
@@ -330,6 +332,17 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    """Return a nearest-rank percentile for finite values, or ``None``."""
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not ordered:
+        return None
+    rank = max(1, min(len(ordered), int(math.ceil(float(percentile) * len(ordered)))))
+    return ordered[rank - 1]
+
+
 def _draw_annotation(
     frame: Any,
     detection: Mapping[str, Any] | None,
@@ -458,6 +471,41 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             if value is not None
         ]
         valid_count = sum(1 for row in rows if _truthy(row.get("valid")))
+        # ``quality_ok`` was added after the first V2 exports.  For legacy CSVs
+        # without that column, preserve the old interpretation (valid samples
+        # are the accepted samples) instead of reporting every row as rejected.
+        has_quality_column = any("quality_ok" in row for row in rows)
+        quality_ok_count = (
+            sum(1 for row in rows if _truthy(row.get("quality_ok")))
+            if has_quality_column
+            else valid_count
+        )
+        quality_rejected_count = max(0, len(rows) - quality_ok_count)
+        rejected_reason_counts: dict[str, int] = {}
+        if has_quality_column:
+            for row in rows:
+                if _truthy(row.get("quality_ok")):
+                    continue
+                reason = str(row.get("rejected_reason") or row.get("error") or "unknown").strip()
+                if not reason:
+                    reason = "unknown"
+                rejected_reason_counts[reason] = rejected_reason_counts.get(reason, 0) + 1
+        temporal_distances = [
+            value
+            for value in (_number(row, "temporal_distance") for row in rows)
+            if value is not None and value >= 0
+        ]
+        temporal_summary = {
+            "samples": len(temporal_distances),
+            "min": round(min(temporal_distances), 5) if temporal_distances else None,
+            "mean": round(sum(temporal_distances) / len(temporal_distances), 5)
+            if temporal_distances
+            else None,
+            "p95": round(_percentile(temporal_distances, 0.95), 5)
+            if temporal_distances
+            else None,
+            "max": round(max(temporal_distances), 5) if temporal_distances else None,
+        }
         timestamps = [
             value
             for value in (_integer(row, "capture_timestamp_ns", 0) for row in rows)
@@ -476,6 +524,15 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             "samples": len(rows),
             "valid_samples": valid_count,
             "valid_rate_percent": round(100.0 * valid_count / max(1, len(rows)), 2),
+            "quality_filter": {
+                "quality_ok_samples": quality_ok_count,
+                "quality_rejected_samples": quality_rejected_count,
+                "acceptance_rate_percent": round(
+                    100.0 * quality_ok_count / max(1, len(rows)), 2
+                ),
+                "rejected_reason_counts": rejected_reason_counts,
+                "temporal_distance": temporal_summary,
+            },
             "confidence_threshold": round(float(threshold), 4),
             "confidence_min": round(min(confidences), 4) if confidences else None,
             "confidence_mean": round(sum(confidences) / len(confidences), 4) if confidences else None,
@@ -487,6 +544,12 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             "alignment_at_start": pupil_summary.get("alignment_at_start", {}),
             "alignment_at_stop": pupil_summary.get("alignment_at_stop", {}),
             "camera_runtime": {
+                "recorded_frames": _integer(detector_summary, "recorded_frames", 0),
+                "recording_duration_s": max(
+                    0.0,
+                    _number(detector_summary, "recording_duration_s", 0.0) or 0.0,
+                ),
+                "recording_codec": detector_summary.get("recording_codec"),
                 "frame_transform": detector_summary.get("frame_transform", configured_transforms.get(eye_name, "none")),
                 "transform_applied": bool(detector_summary.get("transform_applied", False)),
                 "transform_verified": bool(detector_summary.get("transform_verified", False)),
@@ -507,6 +570,15 @@ def build_pupil_report(root: Path, session_id: str) -> dict[str, Any]:
             "center_tolerance": config.get("pupil_alignment_center_tolerance", 0.30),
             "max_detection_age_seconds": config.get("pupil_alignment_max_age_seconds", 0.75),
             "confidence_threshold": threshold,
+            "candidate_filter": {
+                "min_y_ratio": config.get("pupil_candidate_min_y_ratio", 0.05),
+                "max_y_ratio": config.get("pupil_candidate_max_y_ratio", 0.95),
+                "max_axis_ratio": config.get("pupil_candidate_max_axis_ratio", 2.8),
+                "max_jump_ratio": config.get("pupil_candidate_max_jump_ratio", 0.35),
+                "min_diameter_ratio": config.get("pupil_candidate_min_diameter_ratio", 0.07),
+                "stability_frames": config.get("pupil_candidate_stability_frames", 3),
+                "purpose": "acceptance/audit layer around Detector2D candidates; does not alter raw confidence or use the operator guide rectangle",
+            },
             "operator_guide": {
                 "margin_x": config.get("preview_guide_margin_x", 0.16),
                 "margin_y": config.get("preview_guide_margin_y", 0.20),
@@ -639,7 +711,7 @@ def build_manifest(root: Path, session_id: str, warnings: list[str] | None = Non
         elif relative.endswith("_pupil.csv"):
             kind, description = (
                 "pupil_detection",
-                "Detector output for the newest frame at each detector sample, including validity, geometry, confidence, and latency.",
+                "Detector output for the newest frame at each detector sample, including validity, geometry, confidence, latency, and quality acceptance/rejection audit fields.",
             )
         elif relative.endswith("_pupil_preview.jpg"):
             kind, description = (

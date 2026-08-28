@@ -14,7 +14,7 @@
 
 ## 有效性与输出
 
-当几何字段完整、中心位于图像内且 `confidence >= pupil_confidence_threshold`（默认 `0.6`）时，样本写入 `valid=1`；否则保留该检测行但写入 `valid=0` 和错误/空几何字段。CSV 还记录检测完成时间和延迟，便于剔除异常样本。
+当候选通过质量筛选（椭圆完整暴露、长宽比合理、候选直径不小于短边的 `7%`、垂直边界合规，且相对上一条稳定轨迹没有异常跳变）并且 `confidence >= pupil_confidence_threshold`（默认 `0.6`）时，样本写入 `quality_ok=1`、`valid=1`；否则仍保留该检测行，写入 `quality_ok=0`、`valid=0` 和 `rejected_reason`。很小的高置信度轮廓常见于睫毛或角膜反光，会以 `pupil_too_small` 拒绝；该比例可按镜头工作距离配置。`temporal_distance` 记录归一化的轨迹位移，便于审计突跳。质量筛选是 Detector2D 外层的接受/审计层，不改写原始置信度，也不使用预览眼眶范围框。
 
 ## 录制前瞳孔对准门禁
 
@@ -25,7 +25,7 @@
 3. 瞳孔中心位于画面中心容差内（默认距中心各方向不超过画面宽/高的 `30%`）；
 4. 条件连续保持 `pupil_alignment_hold_seconds`（默认 `1.5` 秒），且检测帧没有过期（默认 `0.75` 秒）。
 
-不满足时，服务端在 `/api/status` 的 `preflight.pupil_alignment.guidance` 和每只眼的 `pupil.alignment.guidance` 返回操作提示。提示会根据瞳孔中心相对画面的偏移给出“向左/向右/向上/向下微调相机”；尚未找到完整瞳孔时提示把整只瞳孔移入画面；置信度不足时提示微调焦距或曝光。达标期间显示倒计时/进度，连续保持完成后才将 `ready=true`，后端也会拒绝绕过 UI 的 `/api/session/start` 请求。
+不满足时，服务端在 `/api/status` 的 `preflight.pupil_alignment.guidance` 和每只眼的 `pupil.alignment.guidance` 返回操作提示。提示会根据瞳孔中心相对画面的偏移给出“向左/向右/向上/向下微调相机”；尚未找到完整瞳孔时提示把整只瞳孔移入画面；置信度不足时提示微调焦距或曝光。若候选被判定为疑似眼睑/眉毛、暴露不足、形状异常或时间突跳，`direction` 固定为 `search`，界面只提示重新寻找/确认瞳孔，不根据该候选生成上下左右方向建议。达标期间显示倒计时/进度，连续保持完成后才将 `ready=true`，后端也会拒绝绕过 UI 的 `/api/session/start` 请求。
 
 V2 同时返回结构化 `direction`（`left`、`right`、`up`、`down` 及对角组合），Qt 页面据此画箭头。`preview_guide_margin_x/y` 只定义预览中央的“眼眶正对范围”（默认约 68%×60%），帮助医生做相机正对和工作距离粗调；框线按真实 `confidence` 从红色过渡到橙黄色，再在达到配置阈值时显示绿色。它没有进入 `_detect_snapshot()` 的 `valid`、`center_ok` 或 `alignment_eligible` 计算。不能因为眼睛进入建议框或框线变绿就降低阈值或宣称样本有效。
 
@@ -55,4 +55,4 @@ capture_timestamp_ns = (read_started_ns + read_finished_ns) / 2
 2. 根据 `*_frames.csv` 和 `*_pupil.csv` 的序号/时间戳做对齐，不要按 CSV 行号猜测 240 fps 连续性。
 3. 将 `valid=0`、低置信度、检测延迟异常或帧流超时样本标记为缺失；不要用前一帧无条件填充。
 4. 将原始 AVI 作为证据源，`*_annotated.avi` 只用于人工复核和质控。
-5. 报告中的 `confidence_min/mean/max` 同时包含低置信度检测；统计分析应以 `valid` 和预先批准的阈值筛选。保留低置信度行是为了审计，并不保证它们可用于定量结论。
+5. 报告中的 `confidence_min/mean/max` 同时包含低置信度和被质量筛选拒绝的原始候选；统计分析应以 `quality_ok`、`valid` 和预先批准的阈值筛选。先查看 `pupil_report.json` 每只眼的 `quality_filter.rejected_reason_counts`，确认眉毛/眼睑轮廓、暴露不足或时间突跳是否集中出现。保留这些行是为了审计，并不保证它们可用于定量结论。

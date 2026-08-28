@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0 - Detector2D candidate quality gate
+
+- Added a conservative acceptance/audit layer around the existing `Detector2D` output: clipped, implausibly elongated, upper-lid/eyebrow-like, size-jump and position-jump candidates are retained for audit but marked `quality_ok=0` and `valid=0`.
+- Debounced large candidate jumps with a short stability track and reset alignment state after each subject so a previous session cannot unlock the next recording.
+- Suppressed directional arrows for rejected candidates; the operator is told to re-find/confirm the pupil instead of being guided toward an eyelid or eyebrow.
+- Added per-eye rejection counts and trajectory-distance summaries to `pupil_report.json`, and documented the new CSV/report fields for handoff and analysis.
+- Added a configurable minimum candidate-size check (`pupil_too_small`) to suppress tiny high-confidence eyelash/specular-reflection false positives observed during camera adjustment.
+- Clarified Qt startup failures and missing camera status, and made the recording gate visibly fail closed.
+- Hardened session lifecycle acknowledgements: a start/stop timeout or worker crash finalizes the session as `error`, preserves the worker root cause, clears stale recording events, and blocks a new subject until the capture workers are restarted.
+
 ## 0.7.0 - PySide6 version 2 workstation
 
 - Added a native PySide6 operator window with simultaneous right/left eye previews.

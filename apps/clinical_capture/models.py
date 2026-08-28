@@ -132,6 +132,15 @@ class ClinicalConfig:
     pupil_alignment_hold_seconds: float = 1.5
     pupil_alignment_center_tolerance: float = 0.30
     pupil_alignment_max_age_seconds: float = 0.75
+    # Detector2D remains the source of the raw confidence.  These conservative
+    # candidate filters reject clipped/elongated contours and one-frame jumps
+    # before a sample can guide alignment or enter the valid stream.
+    pupil_candidate_min_y_ratio: float = 0.05
+    pupil_candidate_max_y_ratio: float = 0.95
+    pupil_candidate_max_axis_ratio: float = 2.8
+    pupil_candidate_max_jump_ratio: float = 0.35
+    pupil_candidate_min_diameter_ratio: float = 0.07
+    pupil_candidate_stability_frames: int = 3
     # The centered guide approximates the camera's frontal eye-orbit range. It
     # is a visual aid only; pupil validity and the recording gate never use
     # these margins.
@@ -187,6 +196,10 @@ class ClinicalConfig:
             "cameras", "data_dir", "preview_fps", "pupil_detector_fps",
             "pupil_confidence_threshold", "pupil_alignment_hold_seconds",
             "pupil_alignment_center_tolerance", "pupil_alignment_max_age_seconds",
+            "pupil_candidate_min_y_ratio", "pupil_candidate_max_y_ratio",
+            "pupil_candidate_max_axis_ratio", "pupil_candidate_max_jump_ratio",
+            "pupil_candidate_min_diameter_ratio",
+            "pupil_candidate_stability_frames",
             "preview_guide_margin_x", "preview_guide_margin_y",
             "status_interval_seconds",
             "startup_timeout_seconds", "recording_ack_timeout_seconds",
@@ -269,6 +282,44 @@ class ClinicalConfig:
             or not 0.05 <= float(self.pupil_alignment_center_tolerance) <= 0.49
         ):
             raise ValueError("pupil_alignment_center_tolerance must be between 0.05 and 0.49")
+        for name in ("pupil_candidate_min_y_ratio", "pupil_candidate_max_y_ratio"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ValueError(f"{name} must be between 0 and 1")
+        if self.pupil_candidate_max_y_ratio <= self.pupil_candidate_min_y_ratio:
+            raise ValueError("pupil_candidate_max_y_ratio must exceed pupil_candidate_min_y_ratio")
+        if (
+            isinstance(self.pupil_candidate_max_axis_ratio, bool)
+            or not isinstance(self.pupil_candidate_max_axis_ratio, (int, float))
+            or not math.isfinite(float(self.pupil_candidate_max_axis_ratio))
+            or not 1.05 <= float(self.pupil_candidate_max_axis_ratio) <= 10.0
+        ):
+            raise ValueError("pupil_candidate_max_axis_ratio must be between 1.05 and 10")
+        if (
+            isinstance(self.pupil_candidate_max_jump_ratio, bool)
+            or not isinstance(self.pupil_candidate_max_jump_ratio, (int, float))
+            or not math.isfinite(float(self.pupil_candidate_max_jump_ratio))
+            or not 0.05 <= float(self.pupil_candidate_max_jump_ratio) <= 1.0
+        ):
+            raise ValueError("pupil_candidate_max_jump_ratio must be between 0.05 and 1")
+        if (
+            isinstance(self.pupil_candidate_min_diameter_ratio, bool)
+            or not isinstance(self.pupil_candidate_min_diameter_ratio, (int, float))
+            or not math.isfinite(float(self.pupil_candidate_min_diameter_ratio))
+            or not 0.0 <= float(self.pupil_candidate_min_diameter_ratio) <= 0.5
+        ):
+            raise ValueError("pupil_candidate_min_diameter_ratio must be between 0 and 0.5")
+        if (
+            isinstance(self.pupil_candidate_stability_frames, bool)
+            or not isinstance(self.pupil_candidate_stability_frames, int)
+            or not 1 <= self.pupil_candidate_stability_frames <= 10
+        ):
+            raise ValueError("pupil_candidate_stability_frames must be an integer between 1 and 10")
         for name in (
             "status_interval_seconds", "startup_timeout_seconds", "recording_ack_timeout_seconds",
             "shutdown_timeout_seconds", "stale_frame_timeout_seconds",
@@ -304,6 +355,12 @@ class ClinicalConfig:
             "pupil_alignment_hold_seconds": self.pupil_alignment_hold_seconds,
             "pupil_alignment_center_tolerance": self.pupil_alignment_center_tolerance,
             "pupil_alignment_max_age_seconds": self.pupil_alignment_max_age_seconds,
+            "pupil_candidate_min_y_ratio": self.pupil_candidate_min_y_ratio,
+            "pupil_candidate_max_y_ratio": self.pupil_candidate_max_y_ratio,
+            "pupil_candidate_max_axis_ratio": self.pupil_candidate_max_axis_ratio,
+            "pupil_candidate_max_jump_ratio": self.pupil_candidate_max_jump_ratio,
+            "pupil_candidate_min_diameter_ratio": self.pupil_candidate_min_diameter_ratio,
+            "pupil_candidate_stability_frames": self.pupil_candidate_stability_frames,
             "preview_guide_margin_x": self.preview_guide_margin_x,
             "preview_guide_margin_y": self.preview_guide_margin_y,
             "status_interval_seconds": self.status_interval_seconds,

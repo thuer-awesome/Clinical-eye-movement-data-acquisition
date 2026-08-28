@@ -173,7 +173,8 @@ def recording_gate_status(
     if busy:
         reasons.append("正在处理上一项操作，请稍候")
 
-    if app_state in {"recording", "stopping"}:
+    active_session = isinstance(status.get("session"), Mapping) and bool(status.get("session"))
+    if app_state in {"recording", "stopping"} or active_session:
         reasons.append("当前会话正在录制或保存，请先停止当前会话")
     else:
         if app_state != "ready":
@@ -238,7 +239,7 @@ def recording_gate_status(
                 guidance = str(alignment.get("guidance") or "请根据左右眼预览调整相机，等待瞳孔置信度稳定达标")
                 reasons.append(f"双眼瞳孔对准未完成：{guidance}")
 
-    is_recording = app_state in {"recording", "stopping"}
+    is_recording = app_state in {"recording", "stopping"} or active_session
     validation_error: str | None = None
     if fields_ready is None:
         if isinstance(session_fields, Mapping):
@@ -335,8 +336,16 @@ def status_failure_payload(
     detail = str(error).strip() or error.__class__.__name__
     reason = f"本地服务状态读取失败：{detail}"
     previous_state = str(previous.get("app_state") or "")
-    active = previous_state in {"recording", "stopping"} or bool(previous.get("session"))
-    app_state = previous_state if active else "error"
+    # A session object is the durable lifecycle marker. During the recording
+    # handshake the manager can still report ``starting``; if the status call
+    # fails in that window, keep the stop path available by projecting the
+    # payload into the conservative ``stopping`` state.
+    active_session = isinstance(previous.get("session"), Mapping) and bool(previous.get("session"))
+    active = previous_state in {"recording", "stopping"} or active_session
+    if active:
+        app_state = previous_state if previous_state in {"recording", "stopping"} else "stopping"
+    else:
+        app_state = "error"
 
     old_preflight = previous.get("preflight")
     old_cameras = old_preflight.get("cameras") if isinstance(old_preflight, Mapping) else {}
@@ -367,6 +376,11 @@ def status_failure_payload(
         item["pupil"] = {
             "state": "error",
             "valid": False,
+            "quality_ok": False,
+            "quality_state": "error",
+            "rejected_reason": "status_error",
+            "temporal_stable": False,
+            "temporal_distance": None,
             "confidence": 0.0,
             "latency_ms": None,
             "age_ms": None,
@@ -375,6 +389,9 @@ def status_failure_payload(
                 "state": "error",
                 "ready": False,
                 "progress": 0.0,
+                "quality_ok": False,
+                "rejected_reason": "status_error",
+                "temporal_stable": False,
                 "fresh": False,
                 "confidence": 0.0,
                 "threshold": threshold,
@@ -402,6 +419,7 @@ def status_failure_payload(
                 "required": not bool(simulate),
                 "ready": False,
                 "progress": 0.0,
+                "candidate_filter": {},
                 "guidance": reason,
                 "confidence_threshold": 0.6,
             },
@@ -658,10 +676,22 @@ if QT_AVAILABLE:
             confidence = self._alignment.get("confidence", self._pupil.get("confidence", 0.0))
             threshold = self._alignment.get("threshold", self._pupil.get("threshold", 0.6))
             fresh = bool(self._alignment.get("fresh", self._pupil.get("fresh", False)))
-            # A stale last detection must never leave a green-looking guide on
-            # screen while the camera is disconnected or the detector is late.
-            color = QColor(*confidence_color_rgb(confidence, threshold)) if fresh else QColor("#8b9a98")
-            ready = bool(self._alignment.get("ready"))
+            quality_ok = bool(
+                self._alignment.get(
+                    "quality_ok",
+                    self._pupil.get("quality_ok", True),
+                )
+            )
+            # A stale or rejected candidate must never leave a green-looking
+            # guide on screen while the camera is disconnected or Detector2D
+            # is tracking an eyelid/eyebrow contour.
+            stream_healthy = self._stream_state in {"ready", "recording"} and not self._stream_stale
+            color = (
+                QColor(*confidence_color_rgb(confidence, threshold))
+                if stream_healthy and fresh and quality_ok
+                else QColor("#8b9a98")
+            )
+            ready = bool(self._alignment.get("ready")) and stream_healthy and fresh and quality_ok
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(color, 2.0, Qt.PenStyle.SolidLine if ready else Qt.PenStyle.DashLine))
             painter.drawRect(guide)
@@ -761,8 +791,14 @@ if QT_AVAILABLE:
             alignment = pupil.get("alignment") if isinstance(pupil.get("alignment"), Mapping) else {}
             confidence = float(alignment.get("confidence") or pupil.get("confidence") or 0.0)
             threshold = float(alignment.get("threshold") or 0.0)
+            quality_ok = bool(pupil.get("quality_ok", alignment.get("quality_ok", True)))
+            rejected_reason = str(
+                pupil.get("rejected_reason") or alignment.get("rejected_reason") or ""
+            ).strip()
             if pupil.get("state") == "error":
                 self.pupil_label.setText("瞳孔算法不可用")
+            elif not quality_ok and rejected_reason:
+                self.pupil_label.setText("候选已过滤 · 正在重新寻找瞳孔")
             elif pupil.get("valid"):
                 self.pupil_label.setText(f"已捕捉 · 置信度 {confidence:.2f} · 延迟 {float(pupil.get('latency_ms') or 0.0):.1f} ms")
             else:
@@ -840,6 +876,7 @@ if QT_AVAILABLE:
                 QPushButton:hover:!disabled { border-color: #78d1c0; background: #1a3b42; }
                 QPushButton:disabled { color: #60716f; background: #0e1b20; }
                 QPushButton#startButton { border-color: #5bbda9; color: #071613; background: #78d1c0; font-weight: 700; }
+                QPushButton#startButton:disabled { border-color: #6a3f45; color: #aa8580; background: #241b20; }
                 QPushButton#stopButton { border-color: #c86d6c; color: #ffd7d4; background: #4a282d; }
                 QLabel#title { font-size: 24px; font-weight: 700; color: #f0f8f5; }
                 QLabel#subtitle { color: #91aaa5; }
@@ -1110,7 +1147,29 @@ if QT_AVAILABLE:
 
         def _on_manager_started(self, status: Any) -> None:
             self._status = status if isinstance(status, dict) else self.manager.status()
-            self.operation_label.setText("设备启动完成，等待实时预览")
+            app_state = str(self._status.get("app_state") or "") if isinstance(self._status, Mapping) else ""
+            startup_error = str(
+                (self._status.get("last_error") or self._status.get("status_error") or "设备启动失败")
+            ).strip() if isinstance(self._status, Mapping) else "设备启动失败"
+            if app_state == "error":
+                # Do not report an unconfirmed mapping as the primary outcome
+                # when worker startup itself failed; the operator needs the
+                # concrete failure before attempting a rescan/restart.
+                self.operation_label.setText(f"设备启动失败：{startup_error}")
+            elif (
+                isinstance(self._status, Mapping)
+                and not bool(self._status.get("simulate"))
+                and not bool(
+                    (self._status.get("device_settings") or {}).get("confirmed")
+                    if isinstance(self._status.get("device_settings"), Mapping)
+                    else False
+                )
+            ):
+                self.operation_label.setText(
+                    "设备已启动；请扫描并保存左右眼映射和画面方向，保存后才可录制"
+                )
+            else:
+                self.operation_label.setText("设备启动完成，等待实时预览")
             self._render_status()
 
         def _poll_status(self) -> None:
@@ -1160,7 +1219,9 @@ if QT_AVAILABLE:
             app_state = str(status.get("app_state") or "starting")
             preflight = status.get("preflight") if isinstance(status.get("preflight"), Mapping) else {}
             self.mode_chip.setText(f"模式：{'模拟' if simulate else '现场'}")
-            self.state_chip.setText(f"状态：{state_label(app_state)}")
+            # This chip reports the capture process only.  The separate gate
+            # label is the authoritative answer to "can I start recording?".
+            self.state_chip.setText(f"设备状态：{state_label(app_state)}")
             status_error = str(status.get("status_error") or "").strip()
             self.connection_chip.setText(
                 f"本地服务：错误 · {status_error}" if status_error else "本地服务：在线"
@@ -1168,11 +1229,20 @@ if QT_AVAILABLE:
             settings = status.get("device_settings") if isinstance(status.get("device_settings"), Mapping) else {}
             confirmed = bool(settings.get("confirmed")) or simulate
             settings_dirty = self._device_settings_are_dirty()
+            settings_path = str(self.settings_path)
             if settings_dirty:
-                self.device_status_label.setText("有未保存的相机映射或画面方向修改：保存并重启相机后才会生效")
+                self.device_status_label.setText(
+                    f"有未保存的相机映射或画面方向修改：保存并重启相机后才会生效\n设置文件：{settings_path}"
+                )
+            elif settings.get("error"):
+                self.device_status_label.setText(
+                    f"相机设置文件读取失败：{settings.get('error')}\n已回退到当前配置；请扫描并保存。\n设置文件：{settings_path}"
+                )
+            elif confirmed:
+                self.device_status_label.setText(f"本机映射已确认\n设置文件：{settings_path}")
             else:
                 self.device_status_label.setText(
-                    "本机映射已确认" if confirmed else "本机映射尚未确认：请扫描、选择左右眼和画面方向后保存"
+                    f"本机映射尚未确认：请扫描、选择左右眼和画面方向后保存\n设置文件：{settings_path}"
                 )
 
             cameras = preflight.get("cameras") if isinstance(preflight.get("cameras"), Mapping) else {}
@@ -1192,12 +1262,20 @@ if QT_AVAILABLE:
                                 "state": "error",
                                 "valid": False,
                                 "confidence": 0.0,
+                                "quality_ok": False,
+                                "quality_state": "error",
+                                "rejected_reason": "status_missing",
+                                "temporal_stable": False,
+                                "temporal_distance": None,
                                 "alignment": {
                                     "state": "error",
                                     "ready": False,
                                     "fresh": False,
                                     "confidence": 0.0,
                                     "threshold": self.manager.config.pupil_confidence_threshold,
+                                    "quality_ok": False,
+                                    "rejected_reason": "status_missing",
+                                    "temporal_stable": False,
                                     "guidance": "未收到相机状态",
                                 },
                             },
@@ -1223,6 +1301,8 @@ if QT_AVAILABLE:
             else:
                 first_reason = recording_reason_label(gate["reasons"][0]) if gate["reasons"] else "等待设备预检"
                 message = f"暂不可录制：{first_reason}"
+                if "请先确认左右眼相机和画面方向" in message or "映射和画面方向尚未确认" in message:
+                    message += "；请在左侧‘设备映射与方向’点击‘保存并重启相机’"
             self.banner.setText(message)
             self.banner.setProperty("ready", bool(gate["can_record"]))
             self.banner.style().unpolish(self.banner)
@@ -1302,7 +1382,8 @@ if QT_AVAILABLE:
         def _update_controls(self, *_args: Any) -> None:
             status = self._status or {}
             app_state = str(status.get("app_state") or "starting")
-            recording = app_state in {"recording", "stopping"}
+            active_session = isinstance(status.get("session"), Mapping) and bool(status.get("session"))
+            recording = app_state in {"recording", "stopping"} or active_session
             settings_dirty = self._device_settings_are_dirty()
             gate = recording_gate_status(
                 status,

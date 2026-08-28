@@ -8,7 +8,7 @@ Clinical Capture V2 原生双眼临床采集工作站
 4. 左右眼预览中的中央框是“眼眶正对范围”，用于把镜头粗调到正对眼眶；箭头和文字来自 Detector2D 的真实瞳孔位置。框线会按当前置信度由红色过渡到黄色、绿色，掉线/过期帧显示灰色。
 5. 只有双眼置信度达到阈值、几何有效、方向首帧验证完成并连续保持后，“开始录制”才会启用。页面会明确显示“可以录制”或“暂不可录制”及逐条原因；进入范围框或框线变绿本身不会伪造置信度，也不代表门禁已完成。
 6. 录制中若短暂掉线，等待页面显示“重连”结果；成功重连会继续同一会话，重连耗尽则安全结束并保留已有数据。状态读取异常或 FPS 为 0 时会失败关闭并禁用开始按钮。
-7. 停止后点击“导出当前会话 ZIP”。导出包包含原始/标注 AVI、瞳孔 CSV、pupil_report.json、clinical_report.json、quality.json 和校验清单。
+7. 停止后点击“导出当前会话 ZIP”。导出包包含原始/标注 AVI、瞳孔 CSV、pupil_report.json、clinical_report.json、quality.json 和校验清单。`pupil_report.json` 会逐眼统计质量筛选通过/拒绝数量、拒绝原因（如眉毛/眼睑/睫毛小轮廓、暴露不足、时间突跳）和轨迹跳变距离；`*_pupil.csv` 保留 `quality_ok`、`rejected_reason`、`temporal_distance` 原始审计字段。
 
 默认数据目录：
 %LOCALAPPDATA%\ClinicalCapture\data

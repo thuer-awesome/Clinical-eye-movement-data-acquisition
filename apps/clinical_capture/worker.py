@@ -37,6 +37,7 @@ def capture_worker(
     read_failure_threshold: int = 3,
     reconnect_attempts: int = 3,
     reconnect_delay_seconds: float = 0.20,
+    record_generation_state: Any | None = None,
 ) -> None:
     """Capture one camera in its own process.
 
@@ -54,9 +55,11 @@ def capture_worker(
     recording = False
     recorded_frames = 0
     frame_sequence = 0
+    last_capture_timestamp_ns = 0
     recording_started_ns = 0
     recording_path: str | None = None
     recording_codec: str | None = None
+    recording_generation: int | None = None
     writer_is_color = True
     interval_started = time.perf_counter()
     interval_frames = 0
@@ -126,6 +129,11 @@ def capture_worker(
                         if stop_event.wait(reconnect_delay_seconds):
                             break
                         continue
+                    # A reopened handle must prove that the configured pixel
+                    # transform is applied again. This prevents the UI from
+                    # carrying a pre-disconnect verification marker into a
+                    # new DirectShow stream.
+                    transform_verified = False
                     capture, actual_mode, used_attempts = _reconnect_capture(
                         spec,
                         capture,
@@ -159,6 +167,7 @@ def capture_worker(
                     },
                 )
             capture_timestamp_ns = (read_started_ns + read_finished_ns) // 2
+            last_capture_timestamp_ns = capture_timestamp_ns
             frame_sequence = frame_writer.publish(normalized, capture_timestamp_ns)
             interval_frames += 1
             read_durations_ms.append((read_finished_ns - read_started_ns) / 1_000_000.0)
@@ -172,6 +181,11 @@ def capture_worker(
 
             should_record = bool(record_event.is_set())
             if should_record and not recording:
+                command_generation = (
+                    _read_shared_generation(record_generation_state)
+                    if record_generation_state is not None
+                    else None
+                )
                 session_directory = _read_shared_path(record_directory_state)
                 if not session_directory:
                     raise RuntimeError("recording directory was not configured")
@@ -183,7 +197,37 @@ def capture_worker(
                     writer_is_color,
                     recording_codec,
                 ) = _open_recording(spec, Path(session_directory), quality=record_quality)
+                # The manager may clear the event while VideoWriter is being
+                # opened. Re-check both controls before acknowledging or
+                # writing a frame, so a late worker cannot append to an old
+                # session (or consume a later session's directory).
+                if (
+                    stop_event.is_set()
+                    or not record_event.is_set()
+                    or (
+                        record_generation_state is not None
+                        and _read_shared_generation(record_generation_state) != command_generation
+                    )
+                ):
+                    close_error = _close_recording(writer, metadata_handle)
+                    if close_error:
+                        _send(
+                            status_queue,
+                            {
+                                "kind": "error",
+                                "camera": spec.name,
+                                "message": close_error,
+                                "recording_generation": command_generation,
+                            },
+                        )
+                    writer = None
+                    metadata_handle = None
+                    metadata_writer = None
+                    recording_path = None
+                    recording_codec = None
+                    continue
                 recording = True
+                recording_generation = command_generation
                 recorded_frames = 0
                 recording_started_ns = capture_timestamp_ns
                 _send(
@@ -193,10 +237,11 @@ def capture_worker(
                         "camera": spec.name,
                         "path": recording_path,
                         "codec": recording_codec,
+                        "recording_generation": recording_generation,
                     },
                 )
             elif not should_record and recording:
-                _close_recording(writer, metadata_handle)
+                close_error = _close_recording(writer, metadata_handle)
                 writer = None
                 metadata_handle = None
                 metadata_writer = None
@@ -207,11 +252,55 @@ def capture_worker(
                         "kind": "recording_stopped",
                         "camera": spec.name,
                         "path": recording_path,
+                        "recording_codec": recording_codec,
                         "recorded_frames": recorded_frames,
+                        "recording_duration_s": _recording_duration_seconds(
+                            last_capture_timestamp_ns, recording_started_ns
+                        ),
+                        "recording_generation": recording_generation,
+                        "close_error": close_error,
                     },
                 )
+                recording_generation = None
+                recording_started_ns = 0
+                recording_path = None
+                recording_codec = None
 
             if recording and writer is not None and metadata_writer is not None:
+                if (
+                    stop_event.is_set()
+                    or not record_event.is_set()
+                    or (
+                        record_generation_state is not None
+                        and _read_shared_generation(record_generation_state) != recording_generation
+                    )
+                ):
+                    close_error = _close_recording(writer, metadata_handle)
+                    writer = None
+                    metadata_handle = None
+                    metadata_writer = None
+                    recording = False
+                    _send(
+                        status_queue,
+                        {
+                            "kind": "recording_stopped",
+                            "camera": spec.name,
+                            "path": recording_path,
+                            "recording_codec": recording_codec,
+                            "recorded_frames": recorded_frames,
+                            "recording_duration_s": _recording_duration_seconds(
+                                last_capture_timestamp_ns, recording_started_ns
+                            ),
+                            "recording_generation": recording_generation,
+                            "forced": True,
+                            "close_error": close_error,
+                        },
+                    )
+                    recording_generation = None
+                    recording_started_ns = 0
+                    recording_path = None
+                    recording_codec = None
+                    continue
                 if writer_is_color:
                     video_frame = normalized if normalized.ndim == 3 else cv2.cvtColor(normalized, cv2.COLOR_GRAY2BGR)
                 else:
@@ -245,6 +334,7 @@ def capture_worker(
                         "capture_fps": interval_frames / elapsed,
                         "recorded_frames": recorded_frames,
                         "recording": recording,
+                        "recording_generation": recording_generation,
                         "black_percent": 100.0 * black_frames / max(quality_samples, 1),
                         "read_p95_ms": float(np.percentile(read_durations_ms, 95)) if read_durations_ms else 0.0,
                         "mean": last_mean,
@@ -282,25 +372,48 @@ def capture_worker(
         failed = False
     except Exception as error:
         failed = True
-        _send(status_queue, {"kind": "error", "camera": spec.name, "index": spec.index, "message": str(error)})
+        _send(
+            status_queue,
+            {
+                "kind": "error",
+                "camera": spec.name,
+                "index": spec.index,
+                "message": str(error),
+                "recording_generation": recording_generation,
+            },
+        )
     finally:
         if recording:
-            _close_recording(writer, metadata_handle)
+            close_error = _close_recording(writer, metadata_handle)
             _send(
                 status_queue,
                 {
                     "kind": "recording_stopped",
                     "camera": spec.name,
                     "path": recording_path,
+                    "recording_codec": recording_codec,
                     "recorded_frames": recorded_frames,
+                    "recording_duration_s": _recording_duration_seconds(
+                        last_capture_timestamp_ns, recording_started_ns
+                    ),
                     "forced": True,
+                    "recording_generation": recording_generation,
+                    "close_error": close_error,
                 },
             )
         if capture is not None:
             capture.release()
         if frame_writer is not None:
             frame_writer.close()
-        _send(status_queue, {"kind": "stopped", "camera": spec.name, "index": spec.index})
+        _send(
+            status_queue,
+            {
+                "kind": "stopped",
+                "camera": spec.name,
+                "index": spec.index,
+                "recording_generation": recording_generation,
+            },
+        )
     if failed:
         raise SystemExit(1)
 
@@ -488,19 +601,57 @@ def _open_recording(
         writer.release()
         raise RuntimeError(f"could not open video writer for {spec.name}")
     metadata_path = session_directory / f"{spec.name}_frames.csv"
-    handle = metadata_path.open("w", encoding="utf-8", newline="")
-    csv_writer = csv.writer(handle)
-    csv_writer.writerow(("frame_index", "capture_sequence", "timestamp_ns", "wall_time"))
-    handle.flush()
+    handle: Any | None = None
+    try:
+        handle = metadata_path.open("w", encoding="utf-8", newline="")
+        csv_writer = csv.writer(handle)
+        csv_writer.writerow(("frame_index", "capture_sequence", "timestamp_ns", "wall_time"))
+        handle.flush()
+    except Exception:
+        # Opening the AVI can succeed before the timestamp sidecar fails (for
+        # example when the session volume becomes read-only). Release the
+        # writer immediately so the next attempt cannot inherit a live handle.
+        _close_recording(writer, handle)
+        raise
     return writer, handle, csv_writer, base.name, writer_is_color, selected_codec
 
 
-def _close_recording(writer: cv2.VideoWriter | None, metadata_handle: Any | None) -> None:
+def _close_recording(writer: cv2.VideoWriter | None, metadata_handle: Any | None) -> str | None:
+    """Close recording resources without blocking terminal worker events.
+
+    Driver/codec teardown is outside the manager lock and can occasionally
+    raise on a disconnected USB device or a full volume. Returning the error
+    lets the caller keep the ``recording_stopped`` acknowledgement observable;
+    one failing close must not strand the UI in ``正在保存`` forever.
+    """
+    errors: list[str] = []
     if writer is not None:
-        writer.release()
+        try:
+            writer.release()
+        except Exception as error:
+            errors.append(f"video writer close failed: {error}")
     if metadata_handle is not None:
-        metadata_handle.flush()
-        metadata_handle.close()
+        try:
+            metadata_handle.flush()
+        except Exception as error:
+            errors.append(f"frame metadata flush failed: {error}")
+        try:
+            metadata_handle.close()
+        except Exception as error:
+            errors.append(f"frame metadata close failed: {error}")
+    return "; ".join(errors) or None
+
+
+def _recording_duration_seconds(last_capture_timestamp_ns: int, recording_started_ns: int) -> float:
+    """Return a non-negative duration from the worker's capture timestamps."""
+    try:
+        last_timestamp = int(last_capture_timestamp_ns)
+        started_timestamp = int(recording_started_ns)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if last_timestamp <= 0 or started_timestamp <= 0:
+        return 0.0
+    return max(0.0, (last_timestamp - started_timestamp) / 1_000_000_000.0)
 
 
 def _simulation_frame(spec: CameraConfig, sequence: int, timestamp_ns: int) -> np.ndarray:
@@ -552,3 +703,17 @@ def _read_shared_path(state: Any) -> str:
     with state.get_lock():
         raw = bytes(state[:])
     return os.fsdecode(raw.split(b"\x00", 1)[0])
+
+
+def _read_shared_generation(state: Any | None) -> int:
+    """Read the optional recording command generation from shared state."""
+    if state is None:
+        return 0
+    try:
+        with state.get_lock():
+            return int(state.value)
+    except (AttributeError, TypeError, ValueError, OSError):
+        try:
+            return int(getattr(state, "value", 0))
+        except (AttributeError, TypeError, ValueError, OSError):
+            return 0

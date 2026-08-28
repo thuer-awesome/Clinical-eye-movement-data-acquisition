@@ -20,7 +20,7 @@
 ## 结束与导出
 
 1. 点击“结束并保存”，等待页面回到可复核状态；不要直接关闭浏览器或强制结束进程。
-2. 检查 `quality.json` 对应的 FPS、黑帧、写入帧数和瞳孔有效率，并打开 `pupil_report.json` 或 `*_pupil_preview.jpg` 快速确认检测结果。
+2. 检查 `quality.json` 对应的 FPS、黑帧、写入帧数和瞳孔有效率，并打开 `pupil_report.json` 或 `*_pupil_preview.jpg` 快速确认检测结果。交接时同时查看每只眼 `quality_filter.rejected_reason_counts`；若 `pupil_too_small`、`ellipse_too_elongated`、`pupil_not_fully_exposed` 或 `temporal_jump` 占比异常，先复核原始 AVI、焦距和照明/佩戴状态，不要把拒绝样本当作有效数据。
 3. 在“已完成会话”点击“导出 ZIP”，确认页面显示完整本机路径；需要时复制路径或下载 ZIP。
 4. 将 ZIP 按院内命名、访问控制和备份政策转移；不要把 ZIP 上传到公开 issue、聊天或个人网盘。
 5. 病理/情绪备注只作为研究/筛查记录，不能写成诊断结论。

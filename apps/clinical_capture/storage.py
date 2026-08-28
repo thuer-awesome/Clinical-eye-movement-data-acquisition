@@ -141,6 +141,8 @@ class SessionStore:
                     "required": bool(value.get("required", True)),
                     "capture_fps": value.get("capture_fps", 0.0),
                     "recorded_frames": value.get("recorded_frames", 0),
+                    "recording_duration_s": value.get("recording_duration_s", 0.0),
+                    "recording_codec": value.get("recording_codec"),
                     "black_percent": value.get("black_percent", 0.0),
                     "frame_transform": value.get("frame_transform", "none"),
                     "transform_verified": bool(value.get("transform_verified", False)),

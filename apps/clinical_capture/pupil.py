@@ -40,8 +40,25 @@ PUPIL_CSV_FIELDS = (
     "axis_height",
     "angle",
     "detector_fps",
+    "quality_ok",
+    "rejected_reason",
+    "temporal_distance",
     "error",
 )
+
+
+# Detector2D is intentionally kept as the primary detector.  These limits are
+# a small acceptance layer around its single best candidate: they reject an
+# ellipse that is clipped by the image, implausibly elongated, or jumps from a
+# tracked pupil in one detector tick.  They do not alter Detector2D's raw
+# confidence value and they do not use the operator guide rectangle.
+DEFAULT_CANDIDATE_MIN_Y_RATIO = 0.05
+DEFAULT_CANDIDATE_MAX_Y_RATIO = 0.95
+DEFAULT_CANDIDATE_MAX_AXIS_RATIO = 2.8
+DEFAULT_CANDIDATE_MAX_JUMP_RATIO = 0.35
+DEFAULT_CANDIDATE_MIN_DIAMETER_RATIO = 0.07
+DEFAULT_CANDIDATE_STABILITY_FRAMES = 3
+DEFAULT_TRACK_LOST_FRAMES = 8
 
 
 def _finite_float(value: Any, default: float = 0.0) -> float:
@@ -50,6 +67,171 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         return default
     return result if math.isfinite(result) else default
+
+
+def _ellipse_extents(axis_width: float, axis_height: float, angle: float) -> tuple[float, float]:
+    """Return the axis-aligned half extents of a rotated ellipse."""
+    half_width = max(0.0, float(axis_width)) / 2.0
+    half_height = max(0.0, float(axis_height)) / 2.0
+    radians = math.radians(float(angle))
+    cosine = abs(math.cos(radians))
+    sine = abs(math.sin(radians))
+    return (
+        math.sqrt((half_width * cosine) ** 2 + (half_height * sine) ** 2),
+        math.sqrt((half_width * sine) ** 2 + (half_height * cosine) ** 2),
+    )
+
+
+def pupil_candidate_quality(
+    *,
+    frame_width: int,
+    frame_height: int,
+    center_x: float | None,
+    center_y: float | None,
+    axis_width: float | None,
+    axis_height: float | None,
+    diameter: float | None,
+    angle: float = 0.0,
+    previous: Mapping[str, Any] | None = None,
+    min_y_ratio: float = DEFAULT_CANDIDATE_MIN_Y_RATIO,
+    max_y_ratio: float = DEFAULT_CANDIDATE_MAX_Y_RATIO,
+    max_axis_ratio: float = DEFAULT_CANDIDATE_MAX_AXIS_RATIO,
+    max_jump_ratio: float = DEFAULT_CANDIDATE_MAX_JUMP_RATIO,
+    min_diameter_ratio: float = DEFAULT_CANDIDATE_MIN_DIAMETER_RATIO,
+) -> dict[str, Any]:
+    """Classify one Detector2D candidate without changing its confidence.
+
+    Detector2D returns one best ellipse.  A high score alone is not enough to
+    distinguish a pupil from an eyelid/eyebrow edge, especially during camera
+    adjustment.  This helper checks full ellipse exposure, conservative shape
+    limits, and (when a track exists) frame-to-frame displacement.  The raw
+    candidate is still retained for CSV audit; callers decide whether the
+    candidate is usable for guidance and the recording gate.
+    """
+    result: dict[str, Any] = {
+        "ok": False,
+        "reason": "missing_geometry",
+        "axis_ratio": None,
+        "temporal_distance": None,
+        "size_ratio": None,
+        "ellipse_exposed": False,
+    }
+    try:
+        width = int(frame_width)
+        height = int(frame_height)
+    except (TypeError, ValueError, OverflowError):
+        return result | {"reason": "invalid_frame"}
+    if width <= 0 or height <= 0:
+        return result | {"reason": "invalid_frame"}
+    if center_x is None or center_y is None or axis_width is None or axis_height is None:
+        return result
+    try:
+        finite_values = [
+            float(center_x),
+            float(center_y),
+            float(axis_width),
+            float(axis_height),
+            float(angle),
+        ]
+        candidate_diameter = 0.0 if diameter is None else float(diameter)
+    except (TypeError, ValueError, OverflowError):
+        return result
+    if not all(math.isfinite(value) for value in (*finite_values, candidate_diameter)):
+        return result
+    cx, cy, aw, ah, candidate_angle = finite_values
+    if aw <= 0.0 or ah <= 0.0:
+        return result
+    if not (0.0 <= cx < width and 0.0 <= cy < height):
+        return result | {"reason": "center_outside_frame"}
+
+    major = max(aw, ah)
+    minor = min(aw, ah)
+    axis_ratio = major / max(minor, 1e-6)
+    result["axis_ratio"] = round(axis_ratio, 4)
+    if axis_ratio > max(1.01, float(max_axis_ratio)):
+        return result | {"reason": "ellipse_too_elongated"}
+
+    # Very small high-confidence blobs are a frequent eyelash/specular
+    # reflection false positive.  Scale the floor with the frame's shorter
+    # dimension so the same policy works for 320x240 and higher resolutions.
+    # The value is intentionally configurable because lens distance and sensor
+    # crop differ between sites.
+    minimum_diameter = max(1.0, min(float(width), float(height)) * float(min_diameter_ratio))
+    if major < minimum_diameter:
+        return result | {"reason": "pupil_too_small"}
+
+    # A Detector2D ellipse that extends outside the frame is usually a partial
+    # lid/brow contour.  Requiring full exposure matches the clinical intent:
+    # the confidence gate should be based on an actually visible pupil.
+    extent_x, extent_y = _ellipse_extents(aw, ah, candidate_angle)
+    exposed = (
+        cx - extent_x >= 0.0
+        and cy - extent_y >= 0.0
+        and cx + extent_x <= float(width - 1)
+        and cy + extent_y <= float(height - 1)
+    )
+    result["ellipse_exposed"] = exposed
+    if not exposed:
+        return result | {"reason": "pupil_not_fully_exposed"}
+
+    # Keep the sanity band deliberately wider than the operator guide.  The
+    # guide is visual-only; this band only rejects detections at the extreme
+    # image border where an eyebrow/eyelid contour is much more likely.
+    y_ratio = cy / float(height)
+    if y_ratio < float(min_y_ratio) or y_ratio > float(max_y_ratio):
+        return result | {"reason": "candidate_outside_eye_band"}
+
+    # A long, mostly horizontal contour in the upper part of an eye image is a
+    # common eyebrow/upper-lid false positive.  Round or vertically elongated
+    # pupils remain eligible, including when the subject looks upward.
+    if (
+        y_ratio < 0.24
+        and aw >= ah * 1.8
+        and axis_ratio >= 1.8
+    ):
+        return result | {"reason": "upper_lid_or_brow_candidate"}
+
+    if candidate_diameter > 0.0:
+        diameter_difference = abs(candidate_diameter - major)
+        if diameter_difference > max(4.0, major * 0.60):
+            return result | {"reason": "diameter_mismatch"}
+
+    if isinstance(previous, Mapping):
+        previous_x = _finite_float(previous.get("x"), float("nan"))
+        previous_y = _finite_float(previous.get("y"), float("nan"))
+        if math.isfinite(previous_x) and math.isfinite(previous_y):
+            distance = math.hypot((cx - previous_x) / float(width), (cy - previous_y) / float(height))
+            result["temporal_distance"] = round(distance, 5)
+            if distance > max(0.05, float(max_jump_ratio)):
+                return result | {"reason": "temporal_jump"}
+        previous_diameter = _finite_float(previous.get("diameter"), 0.0)
+        if previous_diameter <= 0.0:
+            previous_diameter = max(_finite_float(previous.get("axis_width")), _finite_float(previous.get("axis_height")))
+        if previous_diameter > 0.0 and candidate_diameter > 0.0:
+            size_ratio = max(candidate_diameter, previous_diameter) / max(min(candidate_diameter, previous_diameter), 1e-6)
+            result["size_ratio"] = round(size_ratio, 4)
+            if size_ratio > 2.5:
+                return result | {"reason": "pupil_size_jump"}
+
+    result["ok"] = True
+    result["reason"] = None
+    return result
+
+
+def _rejection_guidance(camera_name: str, reason: str) -> str:
+    """Return non-directional guidance for a rejected detector candidate."""
+    eye_label = {"right_eye": "右眼", "left_eye": "左眼"}.get(camera_name, camera_name)
+    if reason in {"upper_lid_or_brow_candidate", "ellipse_too_elongated", "pupil_too_small"}:
+        return f"{eye_label}检测到疑似眼睑/眉毛/睫毛或反光小轮廓，正在重新寻找瞳孔；请保持眼睛睁开并调整焦距/红外照明"
+    if reason in {"temporal_jump", "pupil_size_jump"}:
+        return f"{eye_label}检测位置变化过快，正在重新确认瞳孔；请保持相机稳定，不要大幅移动"
+    if reason == "pupil_not_fully_exposed":
+        return f"{eye_label}瞳孔未完整暴露，请调整相机距离、角度或焦距"
+    if reason == "candidate_outside_eye_band":
+        return f"{eye_label}候选位于画面边缘，正在重新寻找瞳孔；请把眼眶移入中央范围"
+    if reason == "diameter_mismatch":
+        return f"{eye_label}瞳孔轮廓不稳定，正在重新寻找；请检查焦距和红外照明"
+    return f"{eye_label}未锁定可靠瞳孔，正在重新寻找；请保持相机稳定"
 
 
 def _empty_detection(
@@ -78,6 +260,11 @@ def _empty_detection(
         "frame_width": 0,
         "frame_height": 0,
         "geometry_ok": False,
+        "quality_ok": False,
+        "quality_state": "searching",
+        "rejected_reason": error,
+        "temporal_stable": False,
+        "temporal_distance": None,
         "center_ok": False,
         "direction": "search",
         "guidance": None,
@@ -88,6 +275,9 @@ def _empty_detection(
             "hold_seconds": 0.0,
             "required_hold_seconds": float(alignment_hold_seconds),
             "center_ok": False,
+            "quality_ok": False,
+            "rejected_reason": error,
+            "temporal_stable": False,
             "direction": "search",
             "guidance": None,
         },
@@ -107,11 +297,14 @@ def _alignment_guidance(
     geometry_ok: bool,
     error: str | None,
     center_tolerance: float,
+    rejection_reason: str | None = None,
 ) -> str:
     """Return a short operator instruction for the live alignment step."""
     eye_label = {"right_eye": "右眼", "left_eye": "左眼"}.get(camera_name, camera_name)
     if error:
         return f"{eye_label}瞳孔算法异常，请检查安装或查看日志"
+    if rejection_reason:
+        return _rejection_guidance(camera_name, rejection_reason)
     if not geometry_ok or width <= 0 or height <= 0 or center_x is None or center_y is None:
         return f"请将{eye_label}整只瞳孔移入画面，调整相机位置或焦距"
 
@@ -201,6 +394,12 @@ class PupilDetectorService:
         alignment_hold_seconds: float = 1.5,
         alignment_center_tolerance: float = 0.30,
         alignment_max_age_seconds: float = 0.75,
+        candidate_min_y_ratio: float = DEFAULT_CANDIDATE_MIN_Y_RATIO,
+        candidate_max_y_ratio: float = DEFAULT_CANDIDATE_MAX_Y_RATIO,
+        candidate_max_axis_ratio: float = DEFAULT_CANDIDATE_MAX_AXIS_RATIO,
+        candidate_max_jump_ratio: float = DEFAULT_CANDIDATE_MAX_JUMP_RATIO,
+        candidate_min_diameter_ratio: float = DEFAULT_CANDIDATE_MIN_DIAMETER_RATIO,
+        candidate_stability_frames: int = DEFAULT_CANDIDATE_STABILITY_FRAMES,
     ) -> None:
         self.camera_name = str(camera_name)
         self.eye_id = int(eye_id)
@@ -210,6 +409,12 @@ class PupilDetectorService:
         self.alignment_hold_seconds = max(0.1, float(alignment_hold_seconds))
         self.alignment_center_tolerance = max(0.05, min(0.49, float(alignment_center_tolerance)))
         self.alignment_max_age_seconds = max(0.1, float(alignment_max_age_seconds))
+        self.candidate_min_y_ratio = max(0.0, min(0.45, float(candidate_min_y_ratio)))
+        self.candidate_max_y_ratio = max(self.candidate_min_y_ratio + 0.05, min(1.0, float(candidate_max_y_ratio)))
+        self.candidate_max_axis_ratio = max(1.05, min(10.0, float(candidate_max_axis_ratio)))
+        self.candidate_max_jump_ratio = max(0.05, min(1.0, float(candidate_max_jump_ratio)))
+        self.candidate_min_diameter_ratio = max(0.0, min(0.5, float(candidate_min_diameter_ratio)))
+        self.candidate_stability_frames = max(1, min(10, int(candidate_stability_frames)))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -222,6 +427,10 @@ class PupilDetectorService:
         self._last_sequence = 0
         self._last_update_monotonic: float | None = None
         self._alignment_since_monotonic: float | None = None
+        self._track: dict[str, float] | None = None
+        self._pending_track: dict[str, float] | None = None
+        self._pending_track_count = 0
+        self._track_misses = 0
         self._recent_detection_times: deque[float] = deque(maxlen=120)
         self._recent_valid: deque[bool] = deque(maxlen=120)
         self._recent_latency_ms: deque[float] = deque(maxlen=120)
@@ -249,6 +458,10 @@ class PupilDetectorService:
             self._last_valid = None
             self._last_valid_monotonic = None
             self._alignment_since_monotonic = None
+            self._track = None
+            self._pending_track = None
+            self._pending_track_count = 0
+            self._track_misses = 0
             self._thread = threading.Thread(
                 target=self._run,
                 name=f"clinical-pupil-{self.camera_name}",
@@ -319,6 +532,35 @@ class PupilDetectorService:
             summary["confidence_threshold"] = self.confidence_threshold
             return summary
 
+    def reset_alignment(self, *, reason: str = "session_reset") -> None:
+        """Forget the previous subject's track and alignment hold.
+
+        A completed session must never lend its ``ready`` state to the next
+        subject.  The latest raw detector geometry is retained for preview,
+        but it is made ineligible until a fresh candidate is observed.
+        """
+        with self._lock:
+            self._track = None
+            self._pending_track = None
+            self._pending_track_count = 0
+            self._track_misses = 0
+            self._alignment_since_monotonic = None
+            self._last_valid = None
+            self._last_valid_monotonic = None
+            if self._latest:
+                self._latest["valid"] = False
+                self._latest["quality_ok"] = False
+                self._latest["quality_state"] = "searching"
+                self._latest["rejected_reason"] = str(reason or "session_reset")
+                self._latest["temporal_stable"] = False
+                self._latest["temporal_distance"] = None
+                self._latest["state"] = "ready"
+                self._latest["center_ok"] = False
+                self._latest["alignment_eligible"] = False
+                self._latest["direction"] = "search"
+                self._latest["guidance"] = "请重新确认双眼瞳孔后再开始采集"
+                self._latest["alignment"] = self._alignment_status_locked()
+
     def overlay(
         self,
         frame: np.ndarray,
@@ -353,7 +595,8 @@ class PupilDetectorService:
                     held = True
         valid = bool(pupil.get("valid"))
         age_ms = _finite_float(pupil.get("age_ms"), 9999.0)
-        if valid and age_ms <= 250.0:
+        quality_ok = bool(pupil.get("quality_ok"))
+        if valid and quality_ok and age_ms <= 250.0:
             center = (int(round(_finite_float(pupil.get("x")))), int(round(_finite_float(pupil.get("y")))))
             axis_width = max(1, int(round(_finite_float(pupil.get("axis_width"), 2.0) / 2.0)))
             axis_height = max(1, int(round(_finite_float(pupil.get("axis_height"), 2.0) / 2.0)))
@@ -417,6 +660,85 @@ class PupilDetectorService:
             self._last_sequence = snapshot.sequence
             self._detect_snapshot(snapshot, detector)
 
+    def _track_miss_locked(self) -> None:
+        """Age the candidate track without allowing stale geometry to guide."""
+        self._track_misses += 1
+        self._pending_track = None
+        self._pending_track_count = 0
+        if self._track_misses >= DEFAULT_TRACK_LOST_FRAMES:
+            self._track = None
+            self._track_misses = 0
+
+    def _track_candidate_locked(
+        self,
+        *,
+        frame_width: int,
+        frame_height: int,
+        center_x: float,
+        center_y: float,
+        axis_width: float,
+        axis_height: float,
+        diameter: float,
+        temporal_distance: float | None,
+        size_ratio: float | None,
+    ) -> tuple[bool, bool, str | None]:
+        """Update the short pupil track and debounce large candidate jumps.
+
+        Detector2D can return a convincing ellipse on a lid or eyebrow for a
+        single frame.  A candidate that jumps a large fraction of the frame is
+        therefore held out of guidance until the new location is observed for
+        a few consecutive detector samples.  Normal pupil motion updates the
+        track immediately.
+        """
+        candidate = {
+            "x": float(center_x),
+            "y": float(center_y),
+            "axis_width": float(axis_width),
+            "axis_height": float(axis_height),
+            "diameter": float(diameter),
+        }
+        self._track_misses = 0
+        if self._track is None:
+            self._track = candidate
+            self._pending_track = None
+            self._pending_track_count = 0
+            return True, True, None
+
+        is_jump = (
+            temporal_distance is not None and temporal_distance > self.candidate_max_jump_ratio
+        ) or (size_ratio is not None and size_ratio > 2.5)
+        if not is_jump:
+            self._track = candidate
+            self._pending_track = None
+            self._pending_track_count = 0
+            return True, True, None
+
+        # Keep a separate pending location.  If the same new location persists
+        # long enough, accept it as a genuine eye movement; otherwise keep the
+        # previous track and suppress directional guidance.
+        pending = self._pending_track
+        close_to_pending = False
+        if pending is not None:
+            pending_distance = math.hypot(
+                (candidate["x"] - pending["x"]) / max(1.0, float(frame_width)),
+                (candidate["y"] - pending["y"]) / max(1.0, float(frame_height)),
+            )
+            # A five-pixel tolerance at the supported 320x240 mode, scaled to
+            # larger or smaller frames, is enough to identify the same contour.
+            pixel_tolerance = 5.0 / max(1.0, min(float(frame_width), float(frame_height)))
+            close_to_pending = pending_distance <= max(0.01, pixel_tolerance)
+        if close_to_pending:
+            self._pending_track_count += 1
+        else:
+            self._pending_track = candidate
+            self._pending_track_count = 1
+        if self._pending_track_count >= self.candidate_stability_frames:
+            self._track = candidate
+            self._pending_track = None
+            self._pending_track_count = 0
+            return True, True, None
+        return False, False, "temporal_jump"
+
     def _detect_snapshot(self, snapshot: FrameSnapshot, detector: Any) -> None:
         frame = snapshot.frame
         if frame.ndim == 2:
@@ -460,7 +782,6 @@ class PupilDetectorService:
             and 0.0 <= _finite_float(center[0]) < gray.shape[1]
             and 0.0 <= _finite_float(center[1]) < gray.shape[0]
         )
-        valid = bool(geometry_ok and confidence >= self.confidence_threshold)
         center_x = _finite_float(center[0]) if geometry_ok else None
         center_y = _finite_float(center[1]) if geometry_ok else None
         axis_width = _finite_float(axes[0]) if geometry_ok else None
@@ -470,8 +791,68 @@ class PupilDetectorService:
             diameter = max(axis_width or 0.0, axis_height or 0.0)
         radius = (diameter / 2.0) if diameter is not None and diameter > 0.0 else None
         frame_height, frame_width = gray.shape[:2]
+
+        # Evaluate the candidate against the lightweight acceptance layer and
+        # update the short track while holding the service lock.  The raw
+        # Detector2D geometry remains in the status/CSV even when rejected.
+        quality: dict[str, Any]
+        temporal_stable = False
+        rejection_reason: str | None = None
+        with self._lock:
+            previous_track = dict(self._track) if self._track is not None else None
+            quality = pupil_candidate_quality(
+                frame_width=frame_width,
+                frame_height=frame_height,
+                center_x=center_x,
+                center_y=center_y,
+                axis_width=axis_width,
+                axis_height=axis_height,
+                diameter=diameter,
+                angle=angle,
+                previous=previous_track,
+                min_y_ratio=self.candidate_min_y_ratio,
+                max_y_ratio=self.candidate_max_y_ratio,
+                max_axis_ratio=self.candidate_max_axis_ratio,
+                max_jump_ratio=self.candidate_max_jump_ratio,
+                min_diameter_ratio=self.candidate_min_diameter_ratio,
+            )
+            rejection_reason = quality.get("reason")
+            trackable_jump = quality.get("reason") in {"temporal_jump", "pupil_size_jump"}
+            if geometry_ok and (quality.get("ok") or trackable_jump):
+                accepted, temporal_stable, track_reason = self._track_candidate_locked(
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    center_x=float(center_x),
+                    center_y=float(center_y),
+                    axis_width=float(axis_width),
+                    axis_height=float(axis_height),
+                    diameter=float(diameter or 0.0),
+                    temporal_distance=quality.get("temporal_distance"),
+                    size_ratio=quality.get("size_ratio"),
+                )
+                if not accepted:
+                    quality["ok"] = False
+                    quality["reason"] = track_reason or "temporal_jump"
+                    rejection_reason = quality["reason"]
+                else:
+                    quality["ok"] = True
+                    quality["reason"] = None
+                    rejection_reason = None
+            elif geometry_ok:
+                # Shape/exposure failures are not allowed to seed the track;
+                # after a few such frames the old location is forgotten.
+                self._track_miss_locked()
+            else:
+                self._track_miss_locked()
+
+        quality_ok = bool(geometry_ok and quality.get("ok"))
+        if error:
+            rejection_reason = "detector_error"
+        elif not geometry_ok and not rejection_reason:
+            rejection_reason = "missing_geometry"
+        valid = bool(quality_ok and confidence >= self.confidence_threshold)
         center_ok = bool(
-            geometry_ok
+            quality_ok
             and center_x is not None
             and center_y is not None
             and abs((center_x / max(1.0, float(frame_width))) - 0.5) <= self.alignment_center_tolerance
@@ -482,7 +863,7 @@ class PupilDetectorService:
             height=frame_height,
             center_x=center_x,
             center_y=center_y,
-            geometry_ok=geometry_ok,
+            geometry_ok=quality_ok,
             center_tolerance=self.alignment_center_tolerance,
         )
         guidance = _alignment_guidance(
@@ -493,11 +874,12 @@ class PupilDetectorService:
             center_y=center_y,
             confidence=confidence,
             threshold=self.confidence_threshold,
-            geometry_ok=geometry_ok,
+            geometry_ok=quality_ok,
             error=error,
             center_tolerance=self.alignment_center_tolerance,
+            rejection_reason=rejection_reason,
         )
-        alignment_eligible = bool(valid and center_ok)
+        alignment_eligible = bool(valid and center_ok and temporal_stable)
         update_monotonic = time.monotonic()
 
         with self._lock:
@@ -511,7 +893,7 @@ class PupilDetectorService:
             self._recent_latency_ms.append(latency_ms)
             self._last_update_monotonic = update_monotonic
             self._latest = {
-                "state": "ready",
+                "state": "error" if error else "ready",
                 "valid": valid,
                 "x": center_x,
                 "y": center_y,
@@ -530,6 +912,15 @@ class PupilDetectorService:
                 "frame_width": frame_width,
                 "frame_height": frame_height,
                 "geometry_ok": geometry_ok,
+                "quality_ok": quality_ok,
+                "quality_state": (
+                    "error"
+                    if error
+                    else "accepted" if quality_ok else "rejected"
+                ),
+                "rejected_reason": rejection_reason,
+                "temporal_stable": temporal_stable,
+                "temporal_distance": quality.get("temporal_distance"),
                 "center_ok": center_ok,
                 "alignment_eligible": alignment_eligible,
                 "direction": direction,
@@ -558,6 +949,9 @@ class PupilDetectorService:
                     "axis_height": axis_height,
                     "angle": angle if geometry_ok else None,
                     "detector_fps": self._rate_locked(),
+                    "quality_ok": int(quality_ok),
+                    "rejected_reason": rejection_reason or "",
+                    "temporal_distance": quality.get("temporal_distance"),
                     "error": error or "",
                 },
                 valid=valid,
@@ -615,8 +1009,10 @@ class PupilDetectorService:
             state = "ready"
         elif eligible:
             state = "holding"
-        elif latest.get("geometry_ok"):
+        elif latest.get("geometry_ok") and latest.get("quality_ok"):
             state = "adjust"
+        elif latest.get("geometry_ok"):
+            state = "searching"
         else:
             state = "searching" if latest_state == "ready" else latest_state
 
@@ -642,6 +1038,9 @@ class PupilDetectorService:
             "progress": round(progress, 3),
             "hold_seconds": round(min(hold_seconds, self.alignment_hold_seconds), 3),
             "required_hold_seconds": round(self.alignment_hold_seconds, 3),
+            "quality_ok": bool(latest.get("quality_ok")),
+            "rejected_reason": latest.get("rejected_reason"),
+            "temporal_stable": bool(latest.get("temporal_stable")),
             "center_ok": bool(latest.get("center_ok")),
             "direction": direction,
             "fresh": fresh,

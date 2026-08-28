@@ -13,7 +13,7 @@
 - 新增配置字段：改 `models.py` 的 `from_mapping/validate/public_dict`、示例 JSON、README/数据文档和测试。
 - 改相机采集：改 `worker.py`，保留 `capture_timestamp_ns`、`frames.csv`、状态队列和 `recording_codec` 契约；不要把算法塞回高帧率循环。
 - 处理掉线：优先调 `camera_read_failure_threshold`、`camera_reconnect_attempts` 和 `camera_reconnect_delay_seconds`；不要用“状态仍在线”代替真实帧时间戳，确认 `last_frame_age_ms` 和 `reconnect_count`。
-- 改检测字段：同步 `pupil.py` 的 CSV header、对准门禁状态、UI 状态、`storage.py` 的汇总和 `docs/data-format.md`。
+- 改检测字段：同步 `pupil.py` 的 CSV header、质量接受/拒绝字段、对准门禁状态、UI 状态、`storage.py` 的汇总和 `docs/data-format.md`；被过滤候选必须保持 `direction=search`，不能继续生成方向引导。镜头工作距离改变时，联动评估 `pupil_candidate_min_diameter_ratio`，并用真实样本确认不会误杀远距离瞳孔。
 - 改导出：只在 `exporter.py` 派生文件；原始 AVI 不覆盖；同时维护 `_annotated.avi`、`*_pupil_preview.jpg`、`pupil_report.json`；manifest 排除自身哈希并增加回归测试。
 - 改路由：更新 `docs/api.md`、请求超时和错误映射，确保录制中的设备设置仍返回 `409`。
 - 改打包：同步 `packaging/clinical_capture.spec`、版本号、便携说明和 CI Windows job。

@@ -223,6 +223,7 @@
         pupilNode.classList.toggle("pupil-good", !!pupil.valid);
         pupilNode.classList.toggle("pupil-warn", !pupil.valid);
         if (pupil.state === "error") pupilNode.textContent = "算法不可用";
+        else if (pupil.quality_ok === false && pupil.rejected_reason) pupilNode.textContent = "候选已过滤 · 正在重新寻找瞳孔";
         else if (pupil.valid) pupilNode.textContent = `已捕捉 · r ${Number(pupil.radius || 0).toFixed(1)} px · ${(Number(pupil.confidence || 0) * 100).toFixed(0)}% · ${Number(pupil.detector_fps || 0).toFixed(0)} Hz / ${Number(pupil.latency_ms || 0).toFixed(1)} ms`;
         else if (pupil.state === "ready") pupilNode.textContent = `未锁定 · ${(Number(pupil.confidence || 0) * 100).toFixed(0)}% · ${Number(pupil.detector_fps || 0).toFixed(0)} Hz`;
         else pupilNode.textContent = "检测中";

@@ -1,5 +1,5 @@
 #define AppName "Clinical Capture V2"
-#define AppVersion "0.7.0"
+#define AppVersion "0.8.0"
 #define AppPublisher "Clinical Capture"
 #define AppExeName "ClinicalCaptureV2.exe"
 

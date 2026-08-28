@@ -44,6 +44,14 @@ class ClinicalCaptureManager:
         self._stop_event: Any | None = None
         self._record_event: Any | None = None
         self._record_directory_state: Any | None = None
+        # Shared command generation prevents a worker that is still unwinding
+        # an old recording from treating a newly-set event as that old command.
+        self._record_generation_state: Any | None = None
+        self._active_record_generation: int | None = None
+        self._stopping_record_generation: int | None = None
+        self._recording_expected: set[str] = set()
+        self._recording_stop_pending: set[str] = set()
+        self._recording_stop_baseline: dict[str, int] = {}
         self._state = SessionState.IDLE
         self._last_error: str | None = None
         self._started_monotonic = time.monotonic()
@@ -61,6 +69,12 @@ class ClinicalCaptureManager:
         self._stop_event = self._context.Event()
         self._record_event = self._context.Event()
         self._record_directory_state = self._context.Array("c", 2048, lock=True)
+        self._record_generation_state = self._context.Value("q", 0, lock=True)
+        self._active_record_generation = None
+        self._stopping_record_generation = None
+        self._recording_expected = set()
+        self._recording_stop_pending = set()
+        self._recording_stop_baseline = {}
         self._owners = {
             camera.name: SharedFrameOwner(self._context, camera.frame_shape)
             for camera in self.config.cameras
@@ -75,10 +89,79 @@ class ClinicalCaptureManager:
                 alignment_hold_seconds=self.config.pupil_alignment_hold_seconds,
                 alignment_center_tolerance=self.config.pupil_alignment_center_tolerance,
                 alignment_max_age_seconds=self.config.pupil_alignment_max_age_seconds,
+                candidate_min_y_ratio=self.config.pupil_candidate_min_y_ratio,
+                candidate_max_y_ratio=self.config.pupil_candidate_max_y_ratio,
+                candidate_max_axis_ratio=self.config.pupil_candidate_max_axis_ratio,
+                candidate_max_jump_ratio=self.config.pupil_candidate_max_jump_ratio,
+                candidate_min_diameter_ratio=self.config.pupil_candidate_min_diameter_ratio,
+                candidate_stability_frames=self.config.pupil_candidate_stability_frames,
             )
             for index, camera in enumerate(self.config.cameras)
         }
         self._processes = {}
+
+    def _advance_record_generation(self) -> int:
+        """Atomically invalidate the previous recording command.
+
+        A generation is intentionally separate from the recording directory:
+        clearing/setting a process-shared Event alone leaves a small window in
+        which a worker can observe an old ``True`` value and open its writer
+        after the manager has moved on to another session.
+        """
+        state = self._record_generation_state
+        if state is None:
+            return 0
+        try:
+            with state.get_lock():
+                state.value = int(state.value) + 1
+                return int(state.value)
+        except (AttributeError, TypeError, ValueError, OSError):
+            # Keep compatibility with lightweight test doubles and older
+            # callers that do not provide a shared generation Value.
+            try:
+                state.value = int(getattr(state, "value", 0)) + 1
+                return int(state.value)
+            except (AttributeError, TypeError, ValueError, OSError):
+                return 0
+
+    @staticmethod
+    def _payload_generation(payload: Mapping[str, Any]) -> int | None:
+        """Parse an optional worker recording generation field."""
+        if "recording_generation" not in payload:
+            return None
+        value = payload.get("recording_generation")
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _recording_payload_matches_active_locked(self, payload: Mapping[str, Any]) -> bool:
+        """Return whether a recording status belongs to the live command.
+
+        Payloads from older workers omit the generation. They remain accepted
+        only when this manager was created without a generation control (for
+        example a lightweight legacy test double); a live manager always
+        provides the control to its workers, so accepting a missing token
+        would re-open the stale-ACK race this guard is meant to close.
+        """
+        generation = self._payload_generation(payload)
+        if generation is None:
+            return self._record_generation_state is None
+        return (
+            self._active_record_generation is not None
+            and generation == self._active_record_generation
+            and self._session is not None
+            and self._state in {SessionState.STARTING, SessionState.RECORDING}
+        )
+
+    def _recording_payload_matches_stopping_locked(self, payload: Mapping[str, Any]) -> bool:
+        """Return whether a stop acknowledgement belongs to the prior command."""
+        generation = self._payload_generation(payload)
+        if generation is None:
+            return self._record_generation_state is None
+        return self._stopping_record_generation is not None and generation == self._stopping_record_generation
 
     def _boot_trace(self, message: str) -> None:
         try:
@@ -123,6 +206,7 @@ class ClinicalCaptureManager:
             "transform_verified": False,
             "recording_path": None,
             "recording_codec": None,
+            "recording_generation": None,
             "recording_duration_s": 0.0,
             "error": None,
             "pupil": {
@@ -139,6 +223,11 @@ class ClinicalCaptureManager:
                 "frame_width": 0,
                 "frame_height": 0,
                 "geometry_ok": False,
+                "quality_ok": False,
+                "quality_state": "searching",
+                "rejected_reason": None,
+                "temporal_stable": False,
+                "temporal_distance": None,
                 "center_ok": False,
                 "direction": "search",
                 "guidance": None,
@@ -148,6 +237,9 @@ class ClinicalCaptureManager:
                     "progress": 0.0,
                     "hold_seconds": 0.0,
                     "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                    "quality_ok": False,
+                    "rejected_reason": None,
+                    "temporal_stable": False,
                     "center_ok": False,
                     "direction": "search",
                     "fresh": False,
@@ -197,6 +289,7 @@ class ClinicalCaptureManager:
                         self.config.camera_read_failure_threshold,
                         self.config.camera_reconnect_attempts,
                         self.config.camera_reconnect_delay_seconds,
+                        self._record_generation_state,
                     ),
                 )
                 self._processes[camera.name] = process
@@ -204,6 +297,15 @@ class ClinicalCaptureManager:
                     process.start()
                     self._boot_trace(f"worker {camera.name} started")
                 except Exception as error:
+                    # ``multiprocessing.Process.start`` may fail before a
+                    # child is spawned.  Do not leave that unstarted object in
+                    # the shutdown list: ``join``/``is_alive`` assert on it.
+                    if getattr(process, "pid", None) is None:
+                        self._processes.pop(camera.name, None)
+                        try:
+                            process.close()
+                        except (AssertionError, ValueError, OSError):
+                            pass
                     self._cameras[camera.name]["state"] = "error"
                     self._cameras[camera.name]["error"] = str(error)
                     self._last_error = str(error)
@@ -242,7 +344,11 @@ class ClinicalCaptureManager:
 
     def _restart_once(self) -> dict[str, Any]:
         with self._lifecycle_lock:
-            if self.state == SessionState.RECORDING:
+            # A recording handshake uses STARTING until every worker confirms
+            # its writer.  Restarting during that window must still finalize
+            # the pending session and clear the shared record event; otherwise
+            # the reinitialized workers can inherit an old writer command.
+            if self._session is not None:
                 self.stop_session(failure_reason="采集进程被重启，当前会话已安全结束")
             self._shutdown_workers()
             with self._lock:
@@ -365,6 +471,11 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "quality_ok": False,
+                            "quality_state": "error",
+                            "rejected_reason": "detector_error",
+                            "temporal_stable": False,
+                            "temporal_distance": None,
                             "direction": "search",
                             "guidance": "瞳孔算法不可用，请检查安装或查看日志",
                             "alignment": {
@@ -373,6 +484,9 @@ class ClinicalCaptureManager:
                                 "progress": 0.0,
                                 "hold_seconds": 0.0,
                                 "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "quality_ok": False,
+                                "rejected_reason": "detector_error",
+                                "temporal_stable": False,
                                 "center_ok": False,
                                 "direction": "search",
                                 "fresh": False,
@@ -420,6 +534,11 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "quality_ok": False,
+                            "quality_state": "error",
+                            "rejected_reason": "status_error",
+                            "temporal_stable": False,
+                            "temporal_distance": None,
                             "direction": "search",
                             "alignment": {
                                 "state": "error",
@@ -427,6 +546,9 @@ class ClinicalCaptureManager:
                                 "progress": 0.0,
                                 "hold_seconds": 0.0,
                                 "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "quality_ok": False,
+                                "rejected_reason": "status_error",
+                                "temporal_stable": False,
                                 "center_ok": False,
                                 "direction": "search",
                                 "fresh": False,
@@ -438,6 +560,12 @@ class ClinicalCaptureManager:
                             "error": str(error),
                         }
                 cameras[spec.name] = item
+                if item.get("recording") and self._session is None:
+                    # A residual writer is unsafe even for an optional camera:
+                    # starting another subject could append data to the prior
+                    # session.  Keep this a hard gate so the UI agrees with the
+                    # backend for every camera configuration.
+                    blocking.append(f"{spec.name}: 上一会话仍在录制，请重启采集设备")
                 if item["state"] == "error":
                     (blocking if spec.required else warnings).append(
                         f"{spec.name}: {item.get('error') or '采集进程错误'}"
@@ -522,6 +650,14 @@ class ClinicalCaptureManager:
                     "progress": round(max(0.0, min(1.0, alignment_progress)), 3),
                     "hold_seconds": self.config.pupil_alignment_hold_seconds,
                     "confidence_threshold": self.config.pupil_confidence_threshold,
+                    "candidate_filter": {
+                        "min_y_ratio": self.config.pupil_candidate_min_y_ratio,
+                        "max_y_ratio": self.config.pupil_candidate_max_y_ratio,
+                        "max_axis_ratio": self.config.pupil_candidate_max_axis_ratio,
+                        "max_jump_ratio": self.config.pupil_candidate_max_jump_ratio,
+                        "min_diameter_ratio": self.config.pupil_candidate_min_diameter_ratio,
+                        "stability_frames": self.config.pupil_candidate_stability_frames,
+                    },
                     "operator_guide": {
                         "margin_x": self.config.preview_guide_margin_x,
                         "margin_y": self.config.preview_guide_margin_y,
@@ -532,6 +668,11 @@ class ClinicalCaptureManager:
             }
 
     def start_session(self, metadata: SessionMetadata | Mapping[str, Any]) -> SessionRecord:
+        """Start a session while serializing against stop/restart operations."""
+        with self._lifecycle_lock:
+            return self._start_session_once(metadata)
+
+    def _start_session_once(self, metadata: SessionMetadata | Mapping[str, Any]) -> SessionRecord:
         if not isinstance(metadata, SessionMetadata):
             metadata = SessionMetadata.from_mapping(metadata)
         metadata.validate()
@@ -541,18 +682,42 @@ class ClinicalCaptureManager:
             check = self.preflight()
             if not check["ready"]:
                 raise RuntimeError("; ".join(check["blocking_reasons"]) or "采集预检未通过")
+            residual_recording = [
+                camera.name
+                for camera in self.config.cameras
+                if self._cameras[camera.name].get("recording")
+            ]
+            if residual_recording:
+                raise RuntimeError(
+                    "上一会话仍在录制："
+                    + "、".join(residual_recording)
+                    + "；请重启采集设备后再开始"
+                )
+            if self._record_directory_state is None:
+                raise RuntimeError("recording directory control is unavailable")
             record = self.store.create(metadata, self.config.public_dict())
             record.state = "recording"
             record.started_at = utc_now()
             self.store.save_record(record)
             self._session = record
+            # Keep the state out of READY while camera workers acknowledge the
+            # recording command.  A timeout must be stoppable and must not make
+            # the UI offer a second session over a still-active record event.
+            self._state = SessionState.STARTING
             self._last_error = None
-            if self._record_directory_state is None:
-                raise RuntimeError("recording directory control is unavailable")
+            # Advance before publishing the path/event so every worker sees a
+            # fresh command generation, even when the previous writer is still
+            # finishing its shutdown path.
+            active_generation = self._advance_record_generation()
+            self._active_record_generation = active_generation
+            self._stopping_record_generation = None
             set_shared_path(self._record_directory_state, record.path)
             for camera in self.config.cameras:
                 self._cameras[camera.name]["recording_path"] = None
+                self._cameras[camera.name]["recording_codec"] = None
+                self._cameras[camera.name]["recording_generation"] = None
                 self._cameras[camera.name]["recorded_frames"] = 0
+                self._cameras[camera.name]["recording_duration_s"] = 0.0
                 service = self._pupil_services.get(camera.name)
                 if service is not None:
                     try:
@@ -571,6 +736,11 @@ class ClinicalCaptureManager:
                             "detector_fps": 0.0,
                             "valid_rate": 0.0,
                             "age_ms": None,
+                            "quality_ok": False,
+                            "quality_state": "error",
+                            "rejected_reason": "csv_error",
+                            "temporal_stable": False,
+                            "temporal_distance": None,
                             "direction": "search",
                             "guidance": "瞳孔数据文件创建失败，请检查会话目录权限",
                             "alignment": {
@@ -579,6 +749,9 @@ class ClinicalCaptureManager:
                                 "progress": 0.0,
                                 "hold_seconds": 0.0,
                                 "required_hold_seconds": self.config.pupil_alignment_hold_seconds,
+                                "quality_ok": False,
+                                "rejected_reason": "csv_error",
+                                "temporal_stable": False,
                                 "center_ok": False,
                                 "direction": "search",
                                 "fresh": False,
@@ -596,31 +769,87 @@ class ClinicalCaptureManager:
                 for camera in self.config.cameras
                 if self._cameras[camera.name]["state"] == "ready"
             }
+            self._recording_expected = set(expected)
+            self._recording_stop_pending = set()
+            self._recording_stop_baseline = {}
         if not self._wait_for_recording_ack(expected, timeout=self.config.recording_ack_timeout_seconds):
             self.stop_session(failure_reason="一个或多个采集进程未确认开始录制")
             raise RuntimeError("录制启动超时，已安全结束本次会话")
         with self._lock:
-            if self._session is not None:
-                self._session.state = "recording"
+            # A stop request can complete on another API worker while the
+            # recording acknowledgement wait is in progress.  Never resurrect
+            # that finished session or return ``None`` as a successful record.
+            if self._session is None or self._state != SessionState.STARTING:
+                raise RuntimeError("会话在录制启动确认前已停止")
+            self._session.state = "recording"
             self._state = SessionState.RECORDING
             return self._session
 
     def stop_session(self, failure_reason: str | None = None) -> SessionRecord | None:
+        """Serialize stop/finalize so one session is persisted exactly once."""
+        with self._lifecycle_lock:
+            return self._stop_session_once(failure_reason)
+
+    def _stop_session_once(self, failure_reason: str | None = None) -> SessionRecord | None:
+        # Drain ACKs that were already queued before taking the stop snapshot.
+        # The lifecycle lock prevents a concurrent start, while the generation
+        # below handles a worker that is still unwinding an older command.
+        self._drain_status()
         with self._lock:
             record = self._session
             if record is None:
                 return None
-            if self._state not in {SessionState.RECORDING, SessionState.STOPPING, SessionState.ERROR}:
+            if self._state not in {
+                SessionState.STARTING,
+                # READY is included defensively for a session created by an
+                # older caller before the pending-start state was introduced.
+                # An active _session must always be cleanable, regardless of
+                # the state marker left by that caller.
+                SessionState.READY,
+                SessionState.RECORDING,
+                SessionState.STOPPING,
+                SessionState.ERROR,
+            }:
                 return record
+            prior_state = self._state
             self._state = SessionState.STOPPING
+            self._stopping_record_generation = self._active_record_generation
+            self._active_record_generation = None
+            self._advance_record_generation()
             if self._record_event is not None:
                 self._record_event.clear()
-            expected = {
-                camera.name
-                for camera in self.config.cameras
-                if self._cameras[camera.name].get("recording")
+            expected = set(self._recording_expected)
+            if prior_state != SessionState.STARTING:
+                # A stop packet that was already queued before this call has
+                # made the camera safe; do not wait forever for that packet a
+                # second time. In a pending start, retain every commanded
+                # worker so a late writer-open is still required to settle.
+                expected = {
+                    name for name in expected
+                    if self._cameras.get(name, {}).get("recording")
+                }
+            if not expected:
+                expected = {
+                    camera.name
+                    for camera in self.config.cameras
+                    if self._cameras[camera.name].get("recording")
+                }
+            self._recording_stop_pending = set(expected)
+            self._recording_stop_baseline = {
+                name: int(self._cameras[name].get("sequence") or 0)
+                for name in expected
+                if name in self._cameras
             }
-        self._wait_for_recording_stop(expected, timeout=self.config.recording_ack_timeout_seconds)
+        stop_acknowledged = self._wait_for_recording_stop(
+            expected,
+            timeout=self.config.recording_ack_timeout_seconds,
+        )
+        if not stop_acknowledged and not failure_reason:
+            # Do not return READY while a worker may still own an open writer.
+            # The operator must restart the capture workers before another
+            # subject can be recorded, which prevents sessions from being
+            # appended to the previous AVI after a stop timeout.
+            failure_reason = "一个或多个采集进程未确认停止录制"
         pupil_summaries: dict[str, dict[str, Any]] = {}
         for camera in self.config.cameras:
             service = self._pupil_services.get(camera.name)
@@ -637,6 +866,14 @@ class ClinicalCaptureManager:
                         "csv_path": None,
                         "error": str(error),
                     }
+        # Do not carry one subject's stable pupil track or alignment hold into
+        # the next session.  The summary above intentionally captured the
+        # stop-time state before this reset for report provenance.
+        for service in self._pupil_services.values():
+            try:
+                service.reset_alignment()
+            except Exception:
+                pass
         with self._lock:
             camera_files: dict[str, str] = {}
             camera_stats: dict[str, dict[str, Any]] = {}
@@ -653,6 +890,11 @@ class ClinicalCaptureManager:
                     and fps >= camera.fps * self.config.minimum_fps_ratio
                     and black <= self.config.max_black_percent
                     and int(item.get("recorded_frames") or 0) > 0
+                    # A reconnect invalidates the transform marker until the
+                    # first frame from the new handle is processed. Do not
+                    # call a session clinically ready while that direction
+                    # check is still pending on a real camera.
+                    and (self.config.simulate or bool(item.get("transform_verified")))
                 )
                 camera_stats[camera.name] = {
                     "name": camera.name,
@@ -660,6 +902,7 @@ class ClinicalCaptureManager:
                     "capture_fps": fps,
                     "frames_in_interval": int(item.get("frames_in_interval") or 0),
                     "recorded_frames": int(item.get("recorded_frames") or 0),
+                    "recording_duration_s": max(0.0, float(item.get("recording_duration_s") or 0.0)),
                     "black_percent": black,
                     "read_p95_ms": float(item.get("read_p95_ms") or 0.0),
                     "actual": item.get("actual"),
@@ -706,6 +949,19 @@ class ClinicalCaptureManager:
                 finalized = record
             self._last_session = finalized
             self._session = None
+            self._active_record_generation = None
+            self._stopping_record_generation = None
+            self._recording_expected = set()
+            self._recording_stop_pending = set()
+            self._recording_stop_baseline = {}
+            # Stop ACKs are consumed while the manager is STOPPING, so their
+            # camera entries intentionally do not transition to READY until
+            # finalization is complete. This makes an immediate next-session
+            # start deterministic without masking an unresolved recording
+            # flag or camera error.
+            for item in self._cameras.values():
+                if not item.get("recording") and item.get("state") not in {"error", "offline"}:
+                    item["state"] = "ready"
             # A successful session does not require a process restart before the
             # next subject.  Keep workers in READY while exposing the completed
             # record through last_session for review/export.
@@ -823,6 +1079,10 @@ class ClinicalCaptureManager:
             self._monitor_thread.join(timeout=2.0)
         self._monitor_thread = None
         with self._lock:
+            # Invalidate any command a child may have cached before shutdown.
+            self._active_record_generation = None
+            self._stopping_record_generation = None
+            self._advance_record_generation()
             if self._record_event is not None:
                 self._record_event.clear()
             if self._stop_event is not None:
@@ -830,10 +1090,22 @@ class ClinicalCaptureManager:
             processes = list(self._processes.values())
         self._shutdown_pupil_services()
         for process in processes:
-            process.join(timeout=self.config.shutdown_timeout_seconds)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=2.0)
+            # A Process whose ``start`` raised has no child handle.  Calling
+            # join/is_alive on it raises AssertionError on Windows; discard it
+            # quietly and continue shutting down the other cameras.
+            try:
+                if getattr(process, "pid", None) is None:
+                    process.close()
+                    continue
+                process.join(timeout=self.config.shutdown_timeout_seconds)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2.0)
+            except (AssertionError, ValueError, OSError):
+                try:
+                    process.close()
+                except (AssertionError, ValueError, OSError):
+                    pass
         with self._lock:
             for owner in self._owners.values():
                 owner.close()
@@ -845,6 +1117,10 @@ class ClinicalCaptureManager:
             self._stop_event = None
             self._record_event = None
             self._record_directory_state = None
+            self._record_generation_state = None
+            self._recording_expected = set()
+            self._recording_stop_pending = set()
+            self._recording_stop_baseline = {}
             self._processes = {}
         # Some DirectShow drivers keep the USB handle briefly after process
         # exit. Reopening immediately can yield a healthy-looking 1 fps stream.
@@ -900,6 +1176,38 @@ class ClinicalCaptureManager:
             with self._lock:
                 item = self._cameras[camera_name]
                 kind = payload.get("kind")
+                active_generation_match = self._recording_payload_matches_active_locked(payload)
+                stopping_generation_match = self._recording_payload_matches_stopping_locked(payload)
+
+                # New workers attach a generation to all recording-related
+                # packets. Discard packets from an invalidated command before
+                # they can refresh the frame watchdog or alter recording UI
+                # state. Generation-less packets are accepted only for a
+                # manager explicitly running without the generation control.
+                payload_generation = self._payload_generation(payload)
+                if kind == "recording_started":
+                    if not active_generation_match:
+                        continue
+                if kind == "stats":
+                    if payload_generation is not None and not (
+                        active_generation_match or stopping_generation_match
+                    ):
+                        continue
+                    if (
+                        payload_generation is None
+                        and bool(payload.get("recording"))
+                        and self._record_generation_state is not None
+                    ):
+                        # A live manager cannot identify which generation a
+                        # legacy recording packet belongs to; never let it
+                        # resurrect a writer or refresh a stale heartbeat.
+                        continue
+                if kind == "recording_stopped":
+                    if not stopping_generation_match and not active_generation_match:
+                        continue
+                if kind in {"error", "stopped"} and payload_generation is not None:
+                    if not (active_generation_match or stopping_generation_match):
+                        continue
                 update_monotonic = time.monotonic()
                 item["last_update_monotonic"] = update_monotonic
                 if kind == "starting":
@@ -914,6 +1222,8 @@ class ClinicalCaptureManager:
                         "transform_applied": bool(payload.get("transform_applied")),
                         "transform_verified": bool(payload.get("transform_verified")),
                         "reconnect_count": int(payload.get("reconnect_count") or 0),
+                        "recording": False,
+                        "recording_generation": None,
                     })
                 elif kind == "transform_verified":
                     item.update({
@@ -927,6 +1237,8 @@ class ClinicalCaptureManager:
                 elif kind == "reconnecting":
                     item.update({
                         "state": "reconnecting",
+                        "transform_applied": False,
+                        "transform_verified": False,
                         "reconnect_attempt": int(payload.get("attempt") or 0),
                         "reconnect_attempts": int(payload.get("attempts") or 0),
                         "reconnect_count": int(payload.get("reconnect_count") or item.get("reconnect_count") or 0),
@@ -952,6 +1264,10 @@ class ClinicalCaptureManager:
                         "reconnect_attempts_total": int(item.get("reconnect_attempts_total") or 0) + attempts_used,
                         "last_reconnect_at": payload.get("last_reconnect_at") or utc_now(),
                         "frame_transform": payload.get("frame_transform", item.get("frame_transform")),
+                        # The worker emits a fresh transform_verified event
+                        # after the first frame from this handle.
+                        "transform_applied": False,
+                        "transform_verified": False,
                     })
                 elif kind == "stats":
                     previous_sequence = int(item.get("sequence") or 0)
@@ -977,40 +1293,111 @@ class ClinicalCaptureManager:
                             incoming_sequence > previous_sequence
                             or incoming_timestamp > previous_timestamp
                         )
-                    item.update({key: payload[key] for key in (
+                    stats_updates = {key: payload[key] for key in (
                         "capture_fps", "frames_in_interval", "recorded_frames", "recording", "black_percent", "read_p95_ms",
-                        "mean", "std", "sequence", "timestamp_ns", "recording_path", "recording_codec",
-                        "recording_duration_s", "frame_transform", "transform_applied",
+                        "mean", "std", "sequence", "timestamp_ns", "frame_transform", "transform_applied",
                         "transform_verified", "reconnect_count", "reconnect_attempts_total",
-                        "last_reconnect_at",
-                    ) if key in payload})
+                        "last_reconnect_at", "recording_generation",
+                    ) if key in payload}
+                    # A worker clears these fields immediately after sending
+                    # ``recording_stopped``. A status interval that happens to
+                    # expire afterward therefore carries None/0; never erase
+                    # the path, codec, or elapsed-time evidence already
+                    # acknowledged for this session.
+                    for key in ("recording_path", "recording_codec"):
+                        value = payload.get(key)
+                        if value:
+                            stats_updates[key] = value
+                    if "recording_duration_s" in payload:
+                        try:
+                            incoming_duration = max(0.0, float(payload.get("recording_duration_s") or 0.0))
+                        except (TypeError, ValueError):
+                            incoming_duration = None
+                        if incoming_duration is not None:
+                            try:
+                                current_duration = max(0.0, float(item.get("recording_duration_s") or 0.0))
+                            except (TypeError, ValueError):
+                                current_duration = 0.0
+                            stats_updates["recording_duration_s"] = max(current_duration, incoming_duration)
+                    item.update(stats_updates)
                     if frame_advanced:
                         item["last_frame_monotonic"] = update_monotonic
                         item["read_failures"] = 0
-                        if item.get("recording"):
-                            item["state"] = "recording"
-                        elif item["state"] not in {"error", "offline"}:
-                            item["state"] = "ready"
+                        if self._state != SessionState.STOPPING:
+                            if item.get("recording"):
+                                item["state"] = "recording"
+                            elif item["state"] not in {"error", "offline"}:
+                                item["state"] = "ready"
                 elif kind == "recording_started":
                     item.update({
                         "recording": True,
                         "state": "recording",
                         "recording_path": payload.get("path"),
                         "recording_codec": payload.get("codec"),
+                        "recording_generation": payload_generation,
                     })
                 elif kind == "recording_stopped":
-                    item.update({"recording": False, "state": "ready", "recording_path": payload.get("path"), "recorded_frames": int(payload.get("recorded_frames") or item.get("recorded_frames") or 0)})
+                    if (
+                        payload_generation is None
+                        and self._session is None
+                        and self._state != SessionState.STOPPING
+                    ):
+                        # A legacy worker cannot identify which session it
+                        # stopped after finalization; ignore that late packet.
+                        continue
+                    path = payload.get("path") or item.get("recording_path")
+                    codec = payload.get("recording_codec") or payload.get("codec") or item.get("recording_codec")
+                    item.update({
+                        "recording": False,
+                        "recording_path": path,
+                        "recording_codec": codec,
+                        "recorded_frames": int(payload.get("recorded_frames") or item.get("recorded_frames") or 0),
+                        "recording_generation": None,
+                    })
+                    if "recording_duration_s" in payload:
+                        try:
+                            acknowledged_duration = max(0.0, float(payload.get("recording_duration_s") or 0.0))
+                        except (TypeError, ValueError):
+                            acknowledged_duration = None
+                        if acknowledged_duration is not None:
+                            try:
+                                previous_duration = max(0.0, float(item.get("recording_duration_s") or 0.0))
+                            except (TypeError, ValueError):
+                                previous_duration = 0.0
+                            item["recording_duration_s"] = max(previous_duration, acknowledged_duration)
+                    close_error = str(payload.get("close_error") or "").strip()
+                    if close_error:
+                        item["state"] = "error"
+                        item["error"] = close_error
+                        self._last_error = close_error
+                    if self._state == SessionState.STOPPING and stopping_generation_match:
+                        self._recording_stop_pending.discard(camera_name)
+                    if item.get("state") != "error" and self._state != SessionState.STOPPING:
+                        item["state"] = "ready"
                 elif kind == "error":
                     item.update({"state": "error", "error": str(payload.get("message") or "采集进程错误")})
                     self._last_error = item["error"]
-                elif kind == "stopped" and item["state"] not in {"error", "recording"}:
-                    item["state"] = "offline"
+                elif kind == "stopped":
+                    # A terminal worker event cannot make an existing error
+                    # look healthy.  For non-error states it does, however,
+                    # clear a stale recording flag even if the preceding
+                    # recording_stopped packet was dropped.
+                    item["recording"] = False
+                    item["recording_generation"] = None
+                    if self._state == SessionState.STOPPING and stopping_generation_match:
+                        self._recording_stop_pending.discard(camera_name)
+                    if item["state"] != "error":
+                        item["state"] = "offline"
 
     def _wait_for_recording_ack(self, expected: set[str], *, timeout: float) -> bool:
+        if not expected:
+            return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._drain_status()
             with self._lock:
+                if self._session is None or self._state != SessionState.STARTING:
+                    return False
                 if all(self._cameras[name].get("recording") for name in expected):
                     return True
                 if any(self._cameras[name].get("state") == "error" for name in expected):
@@ -1023,7 +1410,12 @@ class ClinicalCaptureManager:
         while time.monotonic() < deadline:
             self._drain_status()
             with self._lock:
-                if all(not self._cameras[name].get("recording") for name in expected):
+                if self._recording_stop_pending:
+                    if not (self._recording_stop_pending & set(expected)):
+                        return True
+                elif all(not self._cameras[name].get("recording") for name in expected):
+                    # Compatibility for callers that invoke this helper
+                    # directly without initializing the pending set.
                     return True
             time.sleep(0.03)
         return False

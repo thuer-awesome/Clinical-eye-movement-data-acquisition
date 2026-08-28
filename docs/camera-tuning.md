@@ -15,6 +15,8 @@
 | 黑帧上限 | `20%` | 按灰度均值和标准差估计 |
 | 后端 | `dshow` | Windows DirectShow；也支持 `msmf`/`any` |
 
+瞳孔候选还默认要求直径至少达到图像短边的 `7%`（`pupil_candidate_min_diameter_ratio`）。这是为了拦截睫毛或角膜反光形成的很小高置信度轮廓；如果现场工作距离明显更远，应在真实样本上重新验收后再调整该值。
+
 “目标 FPS”与“实际 FPS”必须区分。页面卡片显示的是 `VideoCapture` 读取循环实际测得值；`quality.json` 才是导出后应归档的审计结果。
 
 ## 首次映射
