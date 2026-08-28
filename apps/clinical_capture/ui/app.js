@@ -77,7 +77,7 @@
   }
 
   function cameraStateLabel(value) {
-    return ({ offline: "离线", starting: "启动中", ready: "就绪", recording: "录制中", error: "故障" }[value] || value || "—");
+    return ({ offline: "离线", starting: "启动中", reconnecting: "正在重连", ready: "就绪", recording: "录制中", error: "故障" }[value] || value || "—");
   }
 
   function cameraNameLabel(value) {
@@ -166,7 +166,7 @@
         return `<article class="camera-card ${camera.required ? "" : "optional"}" data-camera="${escapeHtml(camera.name)}">
           <div class="camera-header"><div><span class="camera-name" data-field="name">${escapeHtml(cameraNameLabel(camera.name))}</span><span class="camera-role" data-field="mapping">${camera.required ? "必需" : "可选"} · ${escapeHtml(cameraMappingLabel(camera))}</span><span class="camera-mode" data-field="mode">实际模式检测中</span></div><span class="camera-state" data-field="state">等待</span></div>
           <div class="camera-preview"><img data-preview="${escapeHtml(camera.name)}" src="${previewUrl}?t=${Date.now()}" alt="${escapeHtml(cameraNameLabel(camera.name))} 实时预览" /><div class="preview-empty">等待画面</div></div>
-          <div class="camera-footer"><div class="camera-stat"><label>采集帧率</label><strong data-field="fps">—</strong></div><div class="camera-stat"><label>黑帧</label><strong data-field="black">—</strong></div><div class="camera-stat"><label>已写入</label><strong data-field="frames">—</strong></div><div class="camera-stat pupil-stat"><label>瞳孔捕捉</label><strong data-field="pupil">检测中</strong></div><div class="pupil-alignment" data-field="alignment">等待瞳孔对准提示</div><div class="quality-bar" title="相对目标帧率"><span data-field="quality"></span></div></div>
+          <div class="camera-footer"><div class="camera-stat"><label>采集帧率</label><strong data-field="fps">—</strong></div><div class="camera-stat"><label>黑帧</label><strong data-field="black">—</strong></div><div class="camera-stat"><label>已写入</label><strong data-field="frames">—</strong></div><div class="camera-stat"><label>重连</label><strong data-field="reconnect">0</strong></div><div class="camera-stat pupil-stat"><label>瞳孔捕捉</label><strong data-field="pupil">检测中</strong></div><div class="pupil-alignment" data-field="alignment">等待瞳孔对准提示</div><div class="quality-bar" title="相对目标帧率"><span data-field="quality"></span></div></div>
         </article>`;
       }).join("");
       state.cameraKey = key;
@@ -189,6 +189,7 @@
       card.classList.toggle("error", stateClass === "error" || fpsLow);
       card.classList.toggle("ready", stateClass === "ready");
       card.classList.toggle("recording", stateClass === "recording");
+      card.classList.toggle("reconnecting", stateClass === "reconnecting");
       const stateNode = card.querySelector('[data-field="state"]');
       if (stateNode) { stateNode.className = `camera-state ${escapeHtml(fpsLow ? "error" : stateClass)}`; stateNode.textContent = fpsLow ? "帧率不足" : cameraStateLabel(stateClass); }
       const target = Number(camera.target_fps || 240);
@@ -196,10 +197,20 @@
       card.querySelector('[data-field="fps"]').textContent = fps ? `${fps.toFixed(1)} fps` : "—";
       card.querySelector('[data-field="black"]').textContent = `${Number(camera.black_percent || 0).toFixed(1)}%`;
       card.querySelector('[data-field="frames"]').textContent = `${Number(camera.recorded_frames || 0).toLocaleString()} 帧`;
+      const reconnectNode = card.querySelector('[data-field="reconnect"]');
+      if (reconnectNode) {
+        const reconnects = Number(camera.reconnect_count || 0);
+        reconnectNode.textContent = reconnects ? `${reconnects} 次` : "0";
+        reconnectNode.classList.toggle("pupil-warn", reconnects > 0);
+      }
       const modeNode = card.querySelector('[data-field="mode"]');
       if (modeNode) {
-        modeNode.textContent = camera.actual ? `实际 ${camera.actual}` : `请求 ${camera.requested || "—"}`;
-        modeNode.title = camera.recording_codec ? `录像编码 ${camera.recording_codec}` : "";
+        const transformState = camera.transform_verified
+          ? ` · 方向已应用（${cameraTransformLabel(camera.frame_transform)}）`
+          : ` · 等待方向验证（${cameraTransformLabel(camera.frame_transform)}）`;
+        modeNode.textContent = `${camera.actual ? `实际 ${camera.actual}` : `请求 ${camera.requested || "—"}`}${transformState}`;
+        const reconnects = Number(camera.reconnect_count || 0);
+        modeNode.title = `${camera.recording_codec ? `录像编码 ${camera.recording_codec} · ` : ""}运行期间重连 ${reconnects} 次`;
       }
       const mappingNode = card.querySelector('[data-field="mapping"]');
       if (mappingNode) {
